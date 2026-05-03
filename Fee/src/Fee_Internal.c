@@ -40,31 +40,40 @@ Std_ReturnType Fee_Internal_Init(const Fee_ConfigType* ConfigPtr)
         return E_NOT_OK;
     }
 
-    /* Step 4: Initialize block info table */
-    for (i = 0u; i < FEE_NUMBER_OF_BLOCKS; i++)
+    /* Validate config bounds to avoid out-of-bounds access */
+    if (ConfigPtr->NumberOfBlocks > FEE_NUMBER_OF_BLOCKS)
+    {
+        Fee_ModuleStatus = MEMIF_UNINIT;
+        return E_NOT_OK;
+    }
+
+    /* Step 4: Initialize block info table using runtime config count */
+    for (i = 0u; i < ConfigPtr->NumberOfBlocks; i++)
     {
         Fee_BlockInfoTable[i].Status = FEE_BLOCK_NOT_FOUND;
         Fee_BlockInfoTable[i].DataAddress = 0u;
-        /* Step 5: Set Immediate flag from config */
         Fee_BlockInfoTable[i].Immediate = ConfigPtr->BlockConfig[i].ImmediateData;
     }
 
-    /* Step 6: Scan existing blocks from flash */
+    /* Zero-init any unused trailing entries */
+    for (i = ConfigPtr->NumberOfBlocks; i < FEE_NUMBER_OF_BLOCKS; i++)
+    {
+        Fee_BlockInfoTable[i].Status = FEE_BLOCK_NOT_FOUND;
+        Fee_BlockInfoTable[i].DataAddress = 0u;
+        Fee_BlockInfoTable[i].Immediate = FALSE;
+    }
+
+    /* Step 5: Scan existing blocks from flash.
+     * ScanBlocks preserves the Immediate flag set above. */
     (void)Fee_Sector_ScanBlocks(Fee_BlockInfoTable, ConfigPtr->NumberOfBlocks, ConfigPtr->BlockConfig);
 
-    /* Re-apply Immediate flags (scan may reset them for NOT_FOUND blocks) */
-    for (i = 0u; i < FEE_NUMBER_OF_BLOCKS; i++)
-    {
-        Fee_BlockInfoTable[i].Immediate = ConfigPtr->BlockConfig[i].ImmediateData;
-    }
-
-    /* Step 7: Set module to idle state */
+    /* Step 6: Set module to idle state */
     Fee_ModuleStatus = MEMIF_IDLE;
     Fee_LastJobResult = MEMIF_JOB_OK;
     Fee_JobPending = FALSE;
     Fee_GcPending = FALSE;
 
-    /* Step 8 */
+    /* Step 7 */
     return E_OK;
 }
 
@@ -89,6 +98,21 @@ Std_ReturnType Fee_Internal_QueueJob(const Fee_JobDescriptorType* JobDesc)
     Fee_LastJobResult = MEMIF_JOB_PENDING;
 
     return E_OK;
+}
+
+/* --------------- Helper: complete a job with result and NvM notification --------------- */
+static void Fee_Internal_CompleteJob(Std_ReturnType result)
+{
+    if (result == E_OK)
+    {
+        Fee_LastJobResult = MEMIF_JOB_OK;
+        NvM_JobEndNotification();
+    }
+    else
+    {
+        Fee_LastJobResult = MEMIF_JOB_FAILED;
+        NvM_JobErrorNotification();
+    }
 }
 
 /* --------------- Fee_Internal_ProcessJob --------------- */
@@ -172,16 +196,7 @@ void Fee_Internal_ProcessJob(void)
                                               Fee_PendingJob.BlockOffset,
                                               Fee_PendingJob.DataBufferPtr,
                                               Fee_PendingJob.Length);
-                if (result == E_OK)
-                {
-                    Fee_LastJobResult = MEMIF_JOB_OK;
-                    NvM_JobEndNotification();
-                }
-                else
-                {
-                    Fee_LastJobResult = MEMIF_JOB_FAILED;
-                    NvM_JobErrorNotification();
-                }
+                Fee_Internal_CompleteJob(result);
             }
             else
             {
@@ -195,9 +210,8 @@ void Fee_Internal_ProcessJob(void)
         case FEE_JOB_WRITE:
         {
             uint16 blockSize = Fee_InternalConfigPtr->BlockConfig[blockIndex].BlockSize;
-            uint16 requiredSpace = (uint16)(((uint32)FEE_BLOCK_HEADER_SIZE + (uint32)blockSize +
-                                   FEE_VIRTUAL_PAGE_SIZE - 1u) / FEE_VIRTUAL_PAGE_SIZE *
-                                   FEE_VIRTUAL_PAGE_SIZE);
+            uint16 requiredSpace = (uint16)Fee_Sector_AlignToPage(
+                (uint32)FEE_BLOCK_HEADER_SIZE + (uint32)blockSize);
 
             if (Fee_Sector_HasSpace(requiredSpace) == FALSE)
             {
@@ -210,52 +224,27 @@ void Fee_Internal_ProcessJob(void)
                                            Fee_PendingJob.WriteDataPtr,
                                            blockSize,
                                            blockInfo);
-            if (result == E_OK)
-            {
-                Fee_LastJobResult = MEMIF_JOB_OK;
-                NvM_JobEndNotification();
-            }
-            else
-            {
-                Fee_LastJobResult = MEMIF_JOB_FAILED;
-                NvM_JobErrorNotification();
-            }
+            Fee_Internal_CompleteJob(result);
             break;
         }
 
         case FEE_JOB_INVALIDATE:
         {
-            result = Fee_Sector_InvalidateBlock(Fee_PendingJob.BlockNumber, blockInfo);
-            if (result == E_OK)
-            {
-                Fee_LastJobResult = MEMIF_JOB_OK;
-                NvM_JobEndNotification();
-            }
-            else
-            {
-                Fee_LastJobResult = MEMIF_JOB_FAILED;
-                NvM_JobErrorNotification();
-            }
+            result = Fee_Sector_InvalidateBlock(blockInfo);
+            Fee_Internal_CompleteJob(result);
             break;
         }
 
         case FEE_JOB_ERASE_IMMEDIATE:
         {
+            uint16 blockSize = Fee_InternalConfigPtr->BlockConfig[blockIndex].BlockSize;
             result = Fee_Sector_EraseImmediate(Fee_PendingJob.BlockNumber,
                                                blockInfo,
+                                               blockSize,
                                                Fee_BlockInfoTable,
                                                Fee_InternalConfigPtr->NumberOfBlocks,
                                                Fee_InternalConfigPtr->BlockConfig);
-            if (result == E_OK)
-            {
-                Fee_LastJobResult = MEMIF_JOB_OK;
-                NvM_JobEndNotification();
-            }
-            else
-            {
-                Fee_LastJobResult = MEMIF_JOB_FAILED;
-                NvM_JobErrorNotification();
-            }
+            Fee_Internal_CompleteJob(result);
             break;
         }
 
@@ -310,6 +299,12 @@ const Fee_BlockInfoType* Fee_Internal_GetBlockInfo(uint16 BlockIndex)
     return &Fee_BlockInfoTable[BlockIndex];
 }
 
+/* --------------- Fee_Internal_GetConfigPtr --------------- */
+const Fee_ConfigType* Fee_Internal_GetConfigPtr(void)
+{
+    return Fee_InternalConfigPtr;
+}
+
 /* --------------- Fee_Internal_FindBlockIndex --------------- */
 uint16 Fee_Internal_FindBlockIndex(uint16 BlockNumber)
 {
@@ -359,9 +354,8 @@ void Fee_Internal_CheckAndTriggerGC(void)
     }
 
     /* Compute threshold: aligned header + largest block */
-    threshold = (uint16)(((uint32)FEE_BLOCK_HEADER_SIZE + (uint32)maxBlockSize +
-                 FEE_VIRTUAL_PAGE_SIZE - 1u) / FEE_VIRTUAL_PAGE_SIZE *
-                 FEE_VIRTUAL_PAGE_SIZE);
+    threshold = (uint16)Fee_Sector_AlignToPage(
+        (uint32)FEE_BLOCK_HEADER_SIZE + (uint32)maxBlockSize);
 
     /* Check if active sector has enough space */
     if (Fee_Sector_HasSpace(threshold) == FALSE)

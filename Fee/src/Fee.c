@@ -3,6 +3,43 @@
 #include "Det.h"
 #include <string.h>
 
+#if (FEE_DEV_ERROR_DETECT == STD_ON)
+/* --------------- Helper: check if module is busy --------------- */
+static boolean Fee_IsBusy(void)
+{
+    MemIf_StatusType status = Fee_Internal_GetStatus();
+    return (boolean)((status == MEMIF_BUSY) || (status == MEMIF_BUSY_INTERNAL));
+}
+
+/* --------------- Helper: common DET validation for job-accepting APIs ---------------
+ * Performs uninit, block-number, and busy checks.
+ * Returns E_OK if all checks pass; outBlockIndex is set when block-number validation
+ * is performed. */
+static Std_ReturnType Fee_ValidateJobRequest(uint16 BlockNumber, uint8 ApiServiceId, uint16* outBlockIndex)
+{
+    if (Fee_Internal_GetStatus() == MEMIF_UNINIT)
+    {
+        Det_ReportError(FEE_MODULE_ID, FEE_INSTANCE_ID, ApiServiceId, FEE_E_UNINIT);
+        return E_NOT_OK;
+    }
+
+    *outBlockIndex = Fee_Internal_FindBlockIndex(BlockNumber);
+    if (*outBlockIndex == 0xFFFFu)
+    {
+        Det_ReportError(FEE_MODULE_ID, FEE_INSTANCE_ID, ApiServiceId, FEE_E_INVALID_BLOCK_NO);
+        return E_NOT_OK;
+    }
+
+    if (Fee_IsBusy() != FALSE)
+    {
+        Det_ReportError(FEE_MODULE_ID, FEE_INSTANCE_ID, ApiServiceId, FEE_E_BUSY);
+        return E_NOT_OK;
+    }
+
+    return E_OK;
+}
+#endif /* FEE_DEV_ERROR_DETECT */
+
 /* --------------- Fee_Init --------------- */
 void Fee_Init(const Fee_ConfigType* ConfigPtr)
 {
@@ -38,35 +75,26 @@ Std_ReturnType Fee_Read(uint16 BlockNumber, uint16 BlockOffset, uint8* DataBuffe
     uint16 blockIndex;
 
 #if (FEE_DEV_ERROR_DETECT == STD_ON)
-    if (Fee_Internal_GetStatus() == MEMIF_UNINIT)
     {
-        Det_ReportError(FEE_MODULE_ID, FEE_INSTANCE_ID, FEE_SID_READ, FEE_E_UNINIT);
-        return E_NOT_OK;
-    }
+        const Fee_ConfigType* cfgPtr;
 
-    blockIndex = Fee_Internal_FindBlockIndex(BlockNumber);
-    if (blockIndex == 0xFFFFu)
-    {
-        Det_ReportError(FEE_MODULE_ID, FEE_INSTANCE_ID, FEE_SID_READ, FEE_E_INVALID_BLOCK_NO);
-        return E_NOT_OK;
-    }
+        if (Fee_ValidateJobRequest(BlockNumber, FEE_SID_READ, &blockIndex) != E_OK)
+        {
+            return E_NOT_OK;
+        }
 
-    if (DataBufferPtr == NULL_PTR)
-    {
-        Det_ReportError(FEE_MODULE_ID, FEE_INSTANCE_ID, FEE_SID_READ, FEE_E_PARAM_POINTER);
-        return E_NOT_OK;
-    }
+        if (DataBufferPtr == NULL_PTR)
+        {
+            Det_ReportError(FEE_MODULE_ID, FEE_INSTANCE_ID, FEE_SID_READ, FEE_E_PARAM_POINTER);
+            return E_NOT_OK;
+        }
 
-    if (((uint32)BlockOffset + (uint32)Length) > (uint32)Fee_Config.BlockConfig[blockIndex].BlockSize)
-    {
-        Det_ReportError(FEE_MODULE_ID, FEE_INSTANCE_ID, FEE_SID_READ, FEE_E_INVALID_BLOCK_OFS);
-        return E_NOT_OK;
-    }
-
-    if ((Fee_Internal_GetStatus() == MEMIF_BUSY) || (Fee_Internal_GetStatus() == MEMIF_BUSY_INTERNAL))
-    {
-        Det_ReportError(FEE_MODULE_ID, FEE_INSTANCE_ID, FEE_SID_READ, FEE_E_BUSY);
-        return E_NOT_OK;
+        cfgPtr = Fee_Internal_GetConfigPtr();
+        if (((uint32)BlockOffset + (uint32)Length) > (uint32)cfgPtr->BlockConfig[blockIndex].BlockSize)
+        {
+            Det_ReportError(FEE_MODULE_ID, FEE_INSTANCE_ID, FEE_SID_READ, FEE_E_INVALID_BLOCK_OFS);
+            return E_NOT_OK;
+        }
     }
 #else
     blockIndex = Fee_Internal_FindBlockIndex(BlockNumber);
@@ -74,7 +102,6 @@ Std_ReturnType Fee_Read(uint16 BlockNumber, uint16 BlockOffset, uint8* DataBuffe
     {
         return E_NOT_OK;
     }
-    (void)blockIndex;
 #endif
 
     (void)memset(&jobDesc, 0, sizeof(jobDesc));
@@ -93,28 +120,20 @@ Std_ReturnType Fee_Write(uint16 BlockNumber, const uint8* DataBufferPtr)
     Fee_JobDescriptorType jobDesc;
 
 #if (FEE_DEV_ERROR_DETECT == STD_ON)
-    if (Fee_Internal_GetStatus() == MEMIF_UNINIT)
     {
-        Det_ReportError(FEE_MODULE_ID, FEE_INSTANCE_ID, FEE_SID_WRITE, FEE_E_UNINIT);
-        return E_NOT_OK;
-    }
+        uint16 blockIndex;
 
-    if (Fee_Internal_FindBlockIndex(BlockNumber) == 0xFFFFu)
-    {
-        Det_ReportError(FEE_MODULE_ID, FEE_INSTANCE_ID, FEE_SID_WRITE, FEE_E_INVALID_BLOCK_NO);
-        return E_NOT_OK;
-    }
+        if (Fee_ValidateJobRequest(BlockNumber, FEE_SID_WRITE, &blockIndex) != E_OK)
+        {
+            return E_NOT_OK;
+        }
+        (void)blockIndex;
 
-    if (DataBufferPtr == NULL_PTR)
-    {
-        Det_ReportError(FEE_MODULE_ID, FEE_INSTANCE_ID, FEE_SID_WRITE, FEE_E_PARAM_POINTER);
-        return E_NOT_OK;
-    }
-
-    if ((Fee_Internal_GetStatus() == MEMIF_BUSY) || (Fee_Internal_GetStatus() == MEMIF_BUSY_INTERNAL))
-    {
-        Det_ReportError(FEE_MODULE_ID, FEE_INSTANCE_ID, FEE_SID_WRITE, FEE_E_BUSY);
-        return E_NOT_OK;
+        if (DataBufferPtr == NULL_PTR)
+        {
+            Det_ReportError(FEE_MODULE_ID, FEE_INSTANCE_ID, FEE_SID_WRITE, FEE_E_PARAM_POINTER);
+            return E_NOT_OK;
+        }
     }
 #endif
 
@@ -171,22 +190,14 @@ Std_ReturnType Fee_InvalidateBlock(uint16 BlockNumber)
     Fee_JobDescriptorType jobDesc;
 
 #if (FEE_DEV_ERROR_DETECT == STD_ON)
-    if (Fee_Internal_GetStatus() == MEMIF_UNINIT)
     {
-        Det_ReportError(FEE_MODULE_ID, FEE_INSTANCE_ID, FEE_SID_INVALIDATE_BLOCK, FEE_E_UNINIT);
-        return E_NOT_OK;
-    }
+        uint16 blockIndex;
 
-    if (Fee_Internal_FindBlockIndex(BlockNumber) == 0xFFFFu)
-    {
-        Det_ReportError(FEE_MODULE_ID, FEE_INSTANCE_ID, FEE_SID_INVALIDATE_BLOCK, FEE_E_INVALID_BLOCK_NO);
-        return E_NOT_OK;
-    }
-
-    if ((Fee_Internal_GetStatus() == MEMIF_BUSY) || (Fee_Internal_GetStatus() == MEMIF_BUSY_INTERNAL))
-    {
-        Det_ReportError(FEE_MODULE_ID, FEE_INSTANCE_ID, FEE_SID_INVALIDATE_BLOCK, FEE_E_BUSY);
-        return E_NOT_OK;
+        if (Fee_ValidateJobRequest(BlockNumber, FEE_SID_INVALIDATE_BLOCK, &blockIndex) != E_OK)
+        {
+            return E_NOT_OK;
+        }
+        (void)blockIndex;
     }
 #endif
 
@@ -222,29 +233,20 @@ Std_ReturnType Fee_EraseImmediateBlock(uint16 BlockNumber)
     uint16 blockIndex;
 
 #if (FEE_DEV_ERROR_DETECT == STD_ON)
-    if (Fee_Internal_GetStatus() == MEMIF_UNINIT)
     {
-        Det_ReportError(FEE_MODULE_ID, FEE_INSTANCE_ID, FEE_SID_ERASE_IMMEDIATE_BLOCK, FEE_E_UNINIT);
-        return E_NOT_OK;
-    }
+        const Fee_ConfigType* cfgPtr;
 
-    blockIndex = Fee_Internal_FindBlockIndex(BlockNumber);
-    if (blockIndex == 0xFFFFu)
-    {
-        Det_ReportError(FEE_MODULE_ID, FEE_INSTANCE_ID, FEE_SID_ERASE_IMMEDIATE_BLOCK, FEE_E_INVALID_BLOCK_NO);
-        return E_NOT_OK;
-    }
+        if (Fee_ValidateJobRequest(BlockNumber, FEE_SID_ERASE_IMMEDIATE_BLOCK, &blockIndex) != E_OK)
+        {
+            return E_NOT_OK;
+        }
 
-    if ((Fee_Internal_GetStatus() == MEMIF_BUSY) || (Fee_Internal_GetStatus() == MEMIF_BUSY_INTERNAL))
-    {
-        Det_ReportError(FEE_MODULE_ID, FEE_INSTANCE_ID, FEE_SID_ERASE_IMMEDIATE_BLOCK, FEE_E_BUSY);
-        return E_NOT_OK;
-    }
-
-    if (Fee_Config.BlockConfig[blockIndex].ImmediateData != TRUE)
-    {
-        Det_ReportError(FEE_MODULE_ID, FEE_INSTANCE_ID, FEE_SID_ERASE_IMMEDIATE_BLOCK, FEE_E_INVALID_BLOCK_NO);
-        return E_NOT_OK;
+        cfgPtr = Fee_Internal_GetConfigPtr();
+        if (cfgPtr->BlockConfig[blockIndex].ImmediateData != TRUE)
+        {
+            Det_ReportError(FEE_MODULE_ID, FEE_INSTANCE_ID, FEE_SID_ERASE_IMMEDIATE_BLOCK, FEE_E_INVALID_BLOCK_NO);
+            return E_NOT_OK;
+        }
     }
 #else
     blockIndex = Fee_Internal_FindBlockIndex(BlockNumber);
@@ -252,7 +254,6 @@ Std_ReturnType Fee_EraseImmediateBlock(uint16 BlockNumber)
     {
         return E_NOT_OK;
     }
-    (void)blockIndex;
 #endif
 
     (void)memset(&jobDesc, 0, sizeof(jobDesc));

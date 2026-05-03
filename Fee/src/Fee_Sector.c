@@ -38,9 +38,15 @@ static uint32 ReadLE32(const uint8* buf)
 }
 
 /* --------------- Helper: align to virtual page --------------- */
-static uint32 AlignToPage(uint32 size)
+uint32 Fee_Sector_AlignToPage(uint32 size)
 {
     return ((size + FEE_VIRTUAL_PAGE_SIZE - 1u) / FEE_VIRTUAL_PAGE_SIZE) * FEE_VIRTUAL_PAGE_SIZE;
+}
+
+/* Internal shorthand kept for readability within this file */
+static uint32 AlignToPage(uint32 size)
+{
+    return Fee_Sector_AlignToPage(size);
 }
 
 /* --------------- Helper: check if block header bytes are all 0xFF --------------- */
@@ -91,8 +97,8 @@ static Std_ReturnType WriteSectorHeader(uint8 sectorIdx)
     WriteLE32(&hdr[0], FEE_SECTOR_MAGIC);
     WriteLE32(&hdr[4], Fee_SectorInfo[sectorIdx].SequenceNumber);
     WriteLE16(&hdr[8], Fee_SectorInfo[sectorIdx].EraseCount);
-    hdr[10] = Fee_SectorInfo[sectorIdx].Status;
-    hdr[11] = 0x00u; /* Reserved */
+    hdr[FEE_SECTOR_STATUS_OFFSET] = Fee_SectorInfo[sectorIdx].Status;
+    hdr[FEE_SECTOR_STATUS_OFFSET + 1u] = 0x00u; /* Reserved */
 
     return MemAcc_Write(Fee_SectorInfo[sectorIdx].StartAddress, hdr, FEE_SECTOR_HEADER_SIZE);
 }
@@ -175,7 +181,7 @@ Std_ReturnType Fee_Sector_Init(const Fee_ConfigType* ConfigPtr)
         {
             Fee_SectorInfo[i].SequenceNumber = ReadLE32(&headerBuf[4]);
             Fee_SectorInfo[i].EraseCount = ReadLE16(&headerBuf[8]);
-            Fee_SectorInfo[i].Status = headerBuf[10];
+            Fee_SectorInfo[i].Status = headerBuf[FEE_SECTOR_STATUS_OFFSET];
 
             /* Find write pointer by scanning block entries */
             Fee_SectorInfo[i].WritePointer = FindWritePointer(i);
@@ -252,6 +258,14 @@ Std_ReturnType Fee_Sector_Init(const Fee_ConfigType* ConfigPtr)
             return E_NOT_OK; /* No usable sector */
         }
 
+        /* Erase the sector before formatting to ensure flash is in erased state.
+         * This handles the case where MemAcc backing store is not pre-erased
+         * (e.g., fresh process with zeroed static storage). */
+        if (MemAcc_Erase(Fee_SectorInfo[targetIdx].StartAddress, FEE_SECTOR_SIZE) != E_OK)
+        {
+            return E_NOT_OK;
+        }
+
         /* Format the sector: write header */
         Fee_SectorInfo[targetIdx].SequenceNumber = Fee_NextSequenceNumber;
         Fee_NextSequenceNumber++;
@@ -282,12 +296,11 @@ Std_ReturnType Fee_Sector_ScanBlocks(Fee_BlockInfoType* BlockInfoTable, uint16 N
         return E_NOT_OK;
     }
 
-    /* Step 1: Initialize all entries */
+    /* Step 1: Initialize status and address; preserve Immediate flag (set by caller) */
     for (i = 0u; i < NumBlocks; i++)
     {
         BlockInfoTable[i].Status = FEE_BLOCK_NOT_FOUND;
         BlockInfoTable[i].DataAddress = 0u;
-        BlockInfoTable[i].Immediate = FALSE;
     }
 
     /* Step 2: Build scan order -- sectors sorted by SequenceNumber ascending */
@@ -404,7 +417,7 @@ Std_ReturnType Fee_Sector_ScanBlocks(Fee_BlockInfoType* BlockInfoTable, uint16 N
 
                 /* Continue CRC over data */
                 {
-                    uint8 dataBuf[512]; /* Max block size in our config */
+                    uint8 dataBuf[FEE_MAX_BLOCK_SIZE];
                     uint16 remaining = blockLength;
                     uint32 dataOff = 0u;
 
@@ -547,13 +560,11 @@ Std_ReturnType Fee_Sector_ReadBlock(const Fee_BlockInfoType* BlockInfo, uint16 B
 }
 
 /* --------------- Fee_Sector_InvalidateBlock --------------- */
-Std_ReturnType Fee_Sector_InvalidateBlock(uint16 BlockNumber, Fee_BlockInfoType* BlockInfo)
+Std_ReturnType Fee_Sector_InvalidateBlock(Fee_BlockInfoType* BlockInfo)
 {
     uint32 headerAddr;
     uint32 markerAddr;
     uint8 invalidByte = FEE_VALID_MARKER_INVALID;
-
-    (void)BlockNumber; /* Used for API consistency; address comes from BlockInfo */
 
     if (BlockInfo == NULL_PTR)
     {
@@ -580,47 +591,30 @@ Std_ReturnType Fee_Sector_InvalidateBlock(uint16 BlockNumber, Fee_BlockInfoType*
 
 /* --------------- Fee_Sector_EraseImmediate --------------- */
 Std_ReturnType Fee_Sector_EraseImmediate(uint16 BlockNumber, Fee_BlockInfoType* BlockInfo,
-    Fee_BlockInfoType* BlockInfoTable, uint16 NumBlocks, const Fee_BlockConfigType* BlockConfig)
+    uint16 BlockSize, Fee_BlockInfoType* BlockInfoTable, uint16 NumBlocks, const Fee_BlockConfigType* BlockConfig)
 {
-    uint16 blockSize = 0u;
-    uint16 i;
-    boolean found = FALSE;
     uint32 requiredSpace;
+
+    (void)BlockNumber; /* Kept for AUTOSAR API consistency; operation uses BlockInfo */
 
     if ((BlockInfo == NULL_PTR) || (BlockInfoTable == NULL_PTR) || (BlockConfig == NULL_PTR))
     {
         return E_NOT_OK;
     }
 
-    /* Step 1: Find block config */
-    for (i = 0u; i < NumBlocks; i++)
-    {
-        if (BlockConfig[i].BlockNumber == BlockNumber)
-        {
-            blockSize = BlockConfig[i].BlockSize;
-            found = TRUE;
-            break;
-        }
-    }
-
-    if (found == FALSE)
-    {
-        return E_NOT_OK;
-    }
-
-    /* Step 2: If block has valid data, invalidate first */
+    /* Step 1: If block has valid data, invalidate first */
     if (BlockInfo->Status == FEE_BLOCK_VALID)
     {
-        if (Fee_Sector_InvalidateBlock(BlockNumber, BlockInfo) != E_OK)
+        if (Fee_Sector_InvalidateBlock(BlockInfo) != E_OK)
         {
             return E_NOT_OK;
         }
     }
 
-    /* Step 3: Compute required space */
-    requiredSpace = AlignToPage((uint32)FEE_BLOCK_HEADER_SIZE + (uint32)blockSize);
+    /* Step 2: Compute required space */
+    requiredSpace = AlignToPage((uint32)FEE_BLOCK_HEADER_SIZE + (uint32)BlockSize);
 
-    /* Step 4: If no space, trigger GC */
+    /* Step 3: If no space, trigger GC */
     if (Fee_Sector_HasSpace((uint16)requiredSpace) == FALSE)
     {
         if (Fee_Sector_GarbageCollect(BlockInfoTable, NumBlocks, BlockConfig) != E_OK)
@@ -629,7 +623,7 @@ Std_ReturnType Fee_Sector_EraseImmediate(uint16 BlockNumber, Fee_BlockInfoType* 
         }
     }
 
-    /* Step 5: Set block status */
+    /* Step 4: Set block status */
     BlockInfo->Status = FEE_BLOCK_NOT_FOUND;
 
     return E_OK;
@@ -685,12 +679,12 @@ Std_ReturnType Fee_Sector_GarbageCollect(Fee_BlockInfoType* BlockInfoTable, uint
     oldActiveIdx = Fee_ActiveSectorIndex;
     Fee_ActiveSectorIndex = targetIdx;
 
-    /* Step 4: Copy valid blocks */
+    /* Step 4: Copy valid blocks; reset stale entries for non-copied blocks */
     for (i = 0u; i < (uint8)NumBlocks; i++)
     {
         if (BlockInfoTable[i].Status == FEE_BLOCK_VALID)
         {
-            uint8 tempBuf[512]; /* Large enough for max configured block */
+            uint8 tempBuf[FEE_MAX_BLOCK_SIZE];
             uint16 blockSize = BlockConfig[i].BlockSize;
 
             if (MemAcc_Read(BlockInfoTable[i].DataAddress, tempBuf, (MemAcc_LengthType)blockSize) != E_OK)
@@ -703,11 +697,19 @@ Std_ReturnType Fee_Sector_GarbageCollect(Fee_BlockInfoType* BlockInfoTable, uint
                 return E_NOT_OK;
             }
         }
+        else if ((BlockInfoTable[i].Status == FEE_BLOCK_INVALID) ||
+                 (BlockInfoTable[i].Status == FEE_BLOCK_INCONSISTENT))
+        {
+            /* Clear stale DataAddress for entries not copied to the new sector.
+             * The old sector will be erased, so these addresses become invalid. */
+            BlockInfoTable[i].DataAddress = 0u;
+            BlockInfoTable[i].Status = FEE_BLOCK_NOT_FOUND;
+        }
     }
 
     /* Step 5: Mark old sector as full */
     oldStart = Fee_SectorInfo[oldActiveIdx].StartAddress;
-    if (MemAcc_Write(oldStart + 10u, &fullByte, 1u) != E_OK)
+    if (MemAcc_Write(oldStart + FEE_SECTOR_STATUS_OFFSET, &fullByte, 1u) != E_OK)
     {
         return E_NOT_OK;
     }

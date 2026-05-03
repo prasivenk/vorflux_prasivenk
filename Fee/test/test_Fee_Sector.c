@@ -249,7 +249,7 @@ void test_InvalidateBlock(void)
     TEST_ASSERT_EQUAL(FEE_BLOCK_VALID, blockInfo.Status);
 
     /* Invalidate it */
-    TEST_ASSERT_EQUAL(E_OK, Fee_Sector_InvalidateBlock(1u, &blockInfo));
+    TEST_ASSERT_EQUAL(E_OK, Fee_Sector_InvalidateBlock(&blockInfo));
     TEST_ASSERT_EQUAL(FEE_BLOCK_INVALID, blockInfo.Status);
 
     /* Re-scan: block should show as invalid */
@@ -479,7 +479,7 @@ void test_EraseImmediate(void)
     TEST_ASSERT_EQUAL(FEE_BLOCK_VALID, blockInfo.Status);
 
     /* EraseImmediate */
-    TEST_ASSERT_EQUAL(E_OK, Fee_Sector_EraseImmediate(1u, &blockInfo, blockTable, FEE_NUMBER_OF_BLOCKS, Fee_BlockConfigData));
+    TEST_ASSERT_EQUAL(E_OK, Fee_Sector_EraseImmediate(1u, &blockInfo, 32u, blockTable, FEE_NUMBER_OF_BLOCKS, Fee_BlockConfigData));
     TEST_ASSERT_EQUAL(FEE_BLOCK_NOT_FOUND, blockInfo.Status);
 
     /* Verify on flash: scan should show block as invalid (it was invalidated on flash) */
@@ -623,7 +623,7 @@ void test_InvalidateBlock_NeverWritten(void)
     blockInfo.Status = FEE_BLOCK_NOT_FOUND;
     blockInfo.DataAddress = 0u;
 
-    TEST_ASSERT_EQUAL(E_NOT_OK, Fee_Sector_InvalidateBlock(1u, &blockInfo));
+    TEST_ASSERT_EQUAL(E_NOT_OK, Fee_Sector_InvalidateBlock(&blockInfo));
 }
 
 /* ================================================================

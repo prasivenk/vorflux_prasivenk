@@ -174,7 +174,6 @@ void test_ProcessJob_Write_Success(void)
     job.JobType = FEE_JOB_WRITE;
     job.BlockNumber = 1u;
     job.WriteDataPtr = writeData;
-    job.Length = 32u; /* Note: actual write uses configured block size */
 
     TEST_ASSERT_EQUAL(E_OK, Fee_Internal_QueueJob(&job));
     Fee_Internal_ProcessJob();

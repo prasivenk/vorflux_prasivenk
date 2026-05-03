@@ -64,11 +64,16 @@ typedef enum { FEE_BLOCK_VALID=0, FEE_BLOCK_INVALID, FEE_BLOCK_INCONSISTENT, FEE
  *   Byte 11:    Reserved (alignment)
  */
 #define FEE_SECTOR_HEADER_SIZE      12u
+#define FEE_SECTOR_STATUS_OFFSET    10u   /* Byte offset of Status field within sector header */
 
 #define FEE_SECTOR_MAGIC            0xFEE0FEE0u
 #define FEE_SECTOR_STATUS_ACTIVE    0xAAu  /* 0xFF->0xAA: valid flash write */
 #define FEE_SECTOR_STATUS_FULL      0x00u  /* 0xAA->0x00: valid flash write */
 #define FEE_SECTOR_STATUS_ERASED    0xFFu  /* Default erased state */
+
+/* Maximum configured block data size -- must be >= the largest BlockSize in Fee_BlockConfigData.
+ * Used for stack-allocated buffers during scan and GC. */
+#define FEE_MAX_BLOCK_SIZE          512u
 
 /* Block Status Table entry (RAM) */
 typedef struct {

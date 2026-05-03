@@ -133,14 +133,14 @@ void test_DET_EraseImmediateBlock_BeforeInit(void)
     TEST_ASSERT_EQUAL(FEE_E_UNINIT, Det_GetLastErrorId());
 }
 
-/* Test: Fee_GetStatus before init -> MEMIF_UNINIT (no DET check) */
-void test_DET_GetStatus_BeforeInit(void)
+/* Test: Fee_GetStatus before init -> MEMIF_UNINIT (no DET check, functional behavior) */
+void test_PreInit_GetStatus_ReturnsUninit(void)
 {
     TEST_ASSERT_EQUAL(MEMIF_UNINIT, Fee_GetStatus());
 }
 
-/* Test: Fee_MainFunction before init -> returns without error */
-void test_DET_MainFunction_BeforeInit(void)
+/* Test: Fee_MainFunction before init -> returns without error (functional behavior) */
+void test_PreInit_MainFunction_NoCrash(void)
 {
     Det_ClearLastError();
     Fee_MainFunction();
@@ -736,8 +736,8 @@ int main(void)
     RUN_TEST(test_DET_Cancel_BeforeInit);
     RUN_TEST(test_DET_InvalidateBlock_BeforeInit);
     RUN_TEST(test_DET_EraseImmediateBlock_BeforeInit);
-    RUN_TEST(test_DET_GetStatus_BeforeInit);
-    RUN_TEST(test_DET_MainFunction_BeforeInit);
+    RUN_TEST(test_PreInit_GetStatus_ReturnsUninit);
+    RUN_TEST(test_PreInit_MainFunction_NoCrash);
     RUN_TEST(test_DET_Init_NullPtr);
 
     /* POST-INIT DET tests */
