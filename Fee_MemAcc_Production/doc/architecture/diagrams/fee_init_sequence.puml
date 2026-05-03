@@ -1,0 +1,71 @@
+@startuml fee_init_sequence
+!theme plain
+title Fee Initialization Sequence (Non-Blocking, Multi-Cycle)
+
+participant "NvM" as NvM
+participant "Fee.c\nFee_Init" as Fee
+participant "Fee_StateMachine.c" as SM
+participant "Fee_Sector.c" as Sec
+participant "Fee_Safety.c" as Safety
+participant "MemAcc" as MA
+
+NvM -> Fee : Fee_Init(ConfigPtr)
+activate Fee
+Fee -> SM : Fee_StateMachine_Init(ConfigPtr)
+note right : Sets Fee_InternalState = FEE_STATE_INIT_READ_SECTOR_HEADER\nFee_ModuleStatus = MEMIF_BUSY_INTERNAL\nInitializes BlockInfoTable[], SectorInfo[]
+Fee -> Safety : Fee_Safety_Init()
+note right : Computes initial RAM CRC
+deactivate Fee
+
+== MainFunction cycle 1: Read Sector 0 Header ==
+NvM -> Fee : Fee_MainFunction()
+activate Fee
+Fee -> SM : Fee_StateMachine_Process()
+SM -> MA : MemAcc_Read(AreaId, Sector0.BaseAddress, HeaderBuf, 32)
+note right : FEE_STATE_INIT_READ_SECTOR_HEADER\n→ FEE_STATE_INIT_WAIT_SECTOR_HEADER
+deactivate Fee
+
+== MainFunction cycle 2: Parse Sector 0 Header ==
+NvM -> Fee : Fee_MainFunction()
+activate Fee
+Fee -> SM : Fee_StateMachine_Process()
+SM -> MA : MemAcc_GetJobResult(AreaId)
+SM -> Sec : Fee_Sector_ParseSectorHeader(HeaderBuf, &tmpInfo)
+note right : FEE_STATE_INIT_WAIT_SECTOR_HEADER\nMaps: 0x55→ACTIVE, 0xFF→FULL, 0x00→ERASED\n→ FEE_STATE_INIT_NEXT_SECTOR
+deactivate Fee
+
+== MainFunction cycles 3..N: Repeat for all sectors ==
+note over Fee,SM : Repeats FEE_STATE_INIT_READ_SECTOR_HEADER → WAIT → NEXT\nfor each sector (Fee_InitSectorCursor++)
+
+== After all sector headers: Determine active sector ==
+note over SM : Selects Fee_ActiveSectorIndex =\nsector with highest SequenceNumber among ACTIVE sectors\nSets Fee_ScanRecordCursor = ActiveSector.BaseAddress + 32
+
+== MainFunction cycle: Scan Block Records ==
+NvM -> Fee : Fee_MainFunction()
+activate Fee
+Fee -> SM : Fee_StateMachine_Process()
+SM -> MA : MemAcc_Read(AreaId, ScanRecordCursor, HeaderBuf, 32)
+note right : FEE_STATE_INIT_SCAN_READ_RECORD\n→ FEE_STATE_INIT_SCAN_WAIT_RECORD
+deactivate Fee
+
+== MainFunction cycle: Parse Block Record ==
+NvM -> Fee : Fee_MainFunction()
+activate Fee
+Fee -> SM : Fee_StateMachine_Process()
+SM -> MA : MemAcc_GetJobResult(AreaId)
+SM -> Sec : Fee_Sector_ParseBlockHeader(HeaderBuf, ...)
+note right : Updates Fee_BlockInfoTable[blkIdx]\nif seqCounter >= existing\nAdvances ScanRecordCursor by\nHEADER_SIZE + ALIGN_UP(blockLen, VirtualPageSize)
+deactivate Fee
+
+== Repeat scanning until blank area reached ==
+note over SM : When header is all 0x00 (blank/erased):\nUpdate SectorInfo WritePointer and FreeSpace
+
+== Final transition to IDLE ==
+NvM -> Fee : Fee_MainFunction()
+activate Fee
+Fee -> SM : Fee_StateMachine_Process()
+note right : Fee_ModuleStatus = MEMIF_IDLE\nFee_InternalState = FEE_STATE_IDLE
+Fee -> Safety : Fee_Safety_CyclicCheck()
+deactivate Fee
+
+@enduml

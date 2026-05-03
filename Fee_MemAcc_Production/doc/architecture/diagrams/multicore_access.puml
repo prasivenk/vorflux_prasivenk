@@ -1,0 +1,51 @@
+@startuml multicore_access
+!theme plain
+title Multi-Core Access Model (Single-Core Fee with SchM)
+
+participant "Core 0\n(Fee caller)" as C0
+participant "SchM\n(BSW Scheduler)" as SchM
+participant "Fee.c\n(API Layer)" as Fee
+participant "Fee_StateMachine.c\n(State Machine)" as SM
+participant "MemAcc" as MA
+
+== Write Request with Exclusive Area Protection ==
+C0 -> Fee : Fee_Write(BlockNumber, DataBufferPtr)
+activate Fee
+
+Fee -> SchM : SchM_Enter_Fee_FEE_EXCLUSIVE_AREA_0()
+note right #LightYellow : Disables interrupts or acquires spinlock\n(implementation depends on SchM generator config)
+activate SchM
+
+Fee -> SM : Fee_StateMachine_AcceptJob(&job)
+note right : Reads/writes volatile shared state:\n- Fee_ModuleStatus\n- Fee_CurrentJob\n- Fee_LastJobResult\n- Fee_GcSuspended\n- Fee_InternalState
+
+Fee -> SchM : SchM_Exit_Fee_FEE_EXCLUSIVE_AREA_0()
+deactivate SchM
+
+Fee --> C0 : E_OK / E_NOT_OK
+deactivate Fee
+
+== MainFunction (called from BSW scheduler task) ==
+C0 -> Fee : Fee_MainFunction()
+note right #LightBlue : No exclusive area needed here:\nMainFunction is the sole writer to\nstate machine variables during processing.\nOnly AcceptJob (in API layer) is the\nconcurrent writer, which is protected.
+
+Fee -> SM : Fee_StateMachine_Process()
+SM -> MA : MemAcc_Read/Write/Erase/GetJobResult
+
+note over C0,MA
+    **Design Constraint:** Fee is designed for single-core access only.
+    All Fee APIs must be called from the same OS task / core.
+    The SchM exclusive areas protect against ISR preemption,
+    not multi-core concurrent access.
+    
+    **Volatile qualifiers** on all module state variables ensure
+    compiler does not optimize away reads from ISR-modified state.
+end note
+
+== MemAcc Exclusive Areas (Independent) ==
+C0 -> MA : MemAcc_Read(AreaId, Address, DataPtr, Length)
+MA -> SchM : SchM_Enter_MemAcc_MEMACC_EXCLUSIVE_AREA_0()
+note right : Protects per-area arrays:\n- MemAcc_AreaBusy[]\n- MemAcc_AreaJobResult[]\n- MemAcc_CurrentJob[]\n- MemAcc_AreaLocked[]
+MA -> SchM : SchM_Exit_MemAcc_MEMACC_EXCLUSIVE_AREA_0()
+
+@enduml

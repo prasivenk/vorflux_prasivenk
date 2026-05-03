@@ -1,0 +1,27 @@
+# Failure Handling Strategy
+
+**AUTOSAR R24-11 Fee + MemAcc | Per-Failure-Mode Response**
+
+---
+
+| FM ID | Failure Mode | Detection | Response | Recovery | Safe State |
+|-------|-------------|-----------|----------|----------|------------|
+| FM-001 | Flash write failure | `Mem_DFLS_GetJobResult` returns `MEM_DFLS_JOB_FAILED`; MemAcc sets `MEMACC_JOB_FAILED`; Fee polls via `MemAcc_GetJobResult` | `Dem_SetEventStatus(FEE_E_HARDWARE_ERROR, DEM_EVENT_STATUS_FAILED)`; `Fee_StateMachine_CompleteJob(MEMIF_JOB_FAILED)`; `NvM_JobErrorNotification()` | NvM may retry the write; block remains in previous state (last valid instance preserved) | `FEE_STATE_IDLE` / `MEMIF_IDLE` |
+| FM-002 | Flash read ECC uncorrected | `Mem_DFLS_GetJobResult` returns `MEM_DFLS_JOB_ECC_UNCORRECTED`; MemAcc maps to `MEMACC_JOB_ECC_UNCORRECTED`; DEM reported | `Dem_SetEventStatus(MEMACC_E_HARDWARE_ERROR, DEM_EVENT_STATUS_FAILED)`; MemAcc clears busy flag; Fee sees job failure | No automatic recovery; sector/block may need to be discarded. NvM should use redundant block storage. | Module returns to idle; affected block remains in last known state |
+| FM-003 | Flash read correctable ECC | `Mem_DFLS_GetJobResult` returns `MEM_DFLS_JOB_ECC_CORRECTED`; MemAcc maps to `MEMACC_JOB_ECC_CORRECTED` | Data delivered to caller (corrected by hardware); no DEM report from MemAcc (informational) | Consider proactive rewrite of affected block to refresh flash cells | Normal operation continues |
+| FM-004 | RAM corruption — BlockInfoTable | `Fee_Safety_CyclicCheck`: CRC over BlockInfoTable does not match `Fee_Safety_RamCrc` | `Det_ReportRuntimeError(FEE_E_RAM_INTEGRITY)`; `Dem_SetEventStatus(FEE_E_HARDWARE_ERROR, DEM_EVENT_STATUS_FAILED)` | Re-initialization required (`Fee_Init`); flash data is authoritative | Detection only; module continues operating with potentially corrupted RAM state until re-init |
+| FM-005 | RAM corruption — SectorInfo | Same as FM-004 (SectorInfo included in RAM CRC) | Same as FM-004 | Same as FM-004 | Same as FM-004 |
+| FM-006 | Power loss during write (before ValidMarker) | Init scan: `ValidMarker == FEE_MARKER_ERASED` (0x00) | Block classified as `FEE_BLOCK_INCONSISTENT`; previous valid instance (if any) used | Automatic: init scan selects highest valid sequence counter | Module initializes normally; NvM reads get previous valid data or `MEMIF_BLOCK_INVALID` if first write |
+| FM-007 | Power loss during write (after ValidMarker) | N/A — write committed | N/A | N/A | Normal — data is valid |
+| FM-008 | Power loss during GC (before valid marker on target) | Init scan: target copy has `ValidMarker != 0x55`; source copy still valid | Target copy ignored (inconsistent); source copy used | Automatic recovery during init | Module initializes normally |
+| FM-009 | Power loss during GC erase | Init scan: corrupt/blank sector headers | Sector treated as `FEE_SECTOR_ERASED` | Sector available for reuse; blocks already copied to target are valid | Module initializes normally |
+| FM-010 | CRC error on read | `Fee_Crc_CalculateBlock` result ≠ `BlockInfoTable[].DataCrc` in `FEE_STATE_READ_VERIFY_CRC` | `Dem_SetEventStatus(FEE_E_HARDWARE_ERROR, DEM_EVENT_STATUS_FAILED)`; `CompleteJob(MEMIF_BLOCK_INCONSISTENT)` | NvM may attempt redundant read (if NvM redundancy configured); consider rewriting block | `FEE_STATE_IDLE` / `MEMIF_IDLE` |
+| FM-011 | Sector header corruption | `Fee_Sector_ParseSectorHeader` fails (bad magic `0xFEE0FEE0` or header CRC mismatch) | Sector marked as `FEE_SECTOR_ERASED` during init | Sector available for reuse but all blocks in it are lost | No error state; module initializes normally minus lost blocks |
+| FM-012 | Block header corruption | `Fee_Sector_ParseBlockHeader` returns `E_NOT_OK` | Skip corrupted record; advance scan cursor by `FEE_BLOCK_HEADER_SIZE` | Subsequent valid records in same sector still recovered | Normal init continues |
+| FM-013 | Write pointer corruption | Detected by RAM CRC check (SectorInfo includes WritePointer) | Same as FM-004 | Re-initialization required | Same as FM-004 |
+| FM-014 | Sequence number overflow | Not detected at runtime | Potentially wrong block instance selected | Design mitigation: uint16 provides 65535 writes per block | No runtime safe state; design-time constraint |
+| FM-015 | Erase count overflow | Not detected at runtime | Minor: wear leveling selection suboptimal | Design mitigation: overflow far exceeds flash endurance rating | No impact on safety |
+| FM-016 | GC failure (target full) | `Fee_Sector_AllocateBlock` returns 0 in `FEE_GC_COPY_WRITE_HEADER` | `Dem_SetEventStatus(FEE_E_HARDWARE_ERROR, DEM_EVENT_STATUS_FAILED)`; GC returns `FEE_GC_ERROR` | Fee transitions `FEE_STATE_GC_ACTIVE` → `FEE_STATE_ERROR` → `FEE_STATE_IDLE` | `FEE_STATE_IDLE`; source sector not erased; data preserved |
+| FM-017 | MemAcc timeout | No explicit detection in Fee/MemAcc | Fee stuck in wait state (e.g., `FEE_STATE_READ_WAIT`) | External: OS watchdog triggers reset | No internal safe state; relies on OS watchdog |
+| FM-018 | Stack overflow | No detection in Fee/MemAcc | Undefined behavior | External: OS stack monitoring, MPU protection | Relies on OS/MPU |
+| FM-019 | Flow control violation | `Fee_Safety_FlowCheck`: `FlowCounter != Expected` | `Det_ReportRuntimeError(FEE_E_RAM_INTEGRITY)`; `Dem_SetEventStatus(FEE_E_HARDWARE_ERROR, DEM_EVENT_STATUS_FAILED)` | Flow counter incremented regardless; execution continues | Detection and reporting only |
