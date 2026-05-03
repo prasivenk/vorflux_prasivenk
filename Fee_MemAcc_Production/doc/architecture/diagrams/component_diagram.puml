@@ -1,0 +1,69 @@
+@startuml component_diagram
+!theme plain
+title AUTOSAR R24-11 Fee + MemAcc Component Diagram
+
+package "Application Layer" {
+    [NvM] as NvM
+}
+
+package "Memory Abstraction" {
+    [MemIf] as MemIf
+}
+
+package "ASIL-B BSW Partition" {
+    package "Fee Module" {
+        [Fee.c\n(Public API)] as FeeApi
+        [Fee_StateMachine.c\n(Async State Machine)] as FeeSM
+        [Fee_Sector.c\n(Sector/Block Mgmt)] as FeeSector
+        [Fee_GarbageCollect.c\n(Interruptible GC)] as FeeGC
+        [Fee_Crc.c\n(CRC-16 CCITT)] as FeeCrc
+        [Fee_Safety.c\n(RAM CRC + Flow)] as FeeSafety
+    }
+
+    package "MemAcc Module" {
+        [MemAcc.c\n(Public API)] as MemAccApi
+        [MemAcc_JobProcessing.c\n(MainFunction + Dispatch)] as MemAccJob
+        [MemAcc_AddressArea.c\n(Address Validation)] as MemAccAddr
+    }
+}
+
+package "MCAL Layer" {
+    [Mem_DFLS\n(TC3xx DFLASH Driver)] as MemDFLS
+}
+
+package "Infrastructure" {
+    [Det] as Det
+    [Dem] as Dem
+    [SchM] as SchM
+}
+
+database "TC3xx DFLASH\nHardware" as HW
+
+NvM --> MemIf : Block R/W
+MemIf --> FeeApi : Fee_Read/Write/...
+FeeApi --> FeeSM : Fee_StateMachine_AcceptJob
+FeeApi --> FeeSafety : Fee_Safety_Init
+FeeSM --> FeeSector : Parse/Build Headers\nAllocateBlock
+FeeSM --> FeeGC : Trigger/Process/Suspend/Resume
+FeeSM --> FeeCrc : Fee_Crc_CalculateBlock
+FeeSM --> FeeSafety : Fee_Safety_UpdateRamCrc
+FeeGC --> FeeSector : AllocateBlock\nBuildBlockHeader
+FeeGC --> FeeCrc : Fee_Crc_CalculateBlock
+FeeGC --> FeeSafety : Fee_Safety_UpdateRamCrc
+FeeSM --> MemAccApi : MemAcc_Read/Write/Erase\nMemAcc_GetJobResult/Cancel
+FeeGC --> MemAccApi : MemAcc_Read/Write/Erase\nMemAcc_GetJobResult
+MemAccApi --> MemAccAddr : ValidateAddress\nTranslateAddress
+MemAccApi --> MemAccJob : DispatchToMemDriver
+MemAccJob --> MemDFLS : Mem_DFLS_Read/Write/Erase\nBlankCheck/GetJobResult/MainFunction
+MemDFLS --> HW : Flash I/O
+
+FeeApi --> Det : Det_ReportError
+FeeApi --> SchM : Exclusive Areas
+FeeSM --> Dem : Dem_SetEventStatus
+FeeSafety --> Det : Det_ReportRuntimeError
+FeeSafety --> Dem : Dem_SetEventStatus
+MemAccApi --> Det : Det_ReportError
+MemAccApi --> SchM : Exclusive Areas
+MemAccJob --> Dem : Dem_SetEventStatus
+
+@enduml

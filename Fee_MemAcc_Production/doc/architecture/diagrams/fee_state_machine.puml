@@ -1,0 +1,71 @@
+@startuml fee_state_machine
+!theme plain
+title Fee Main State Machine (Fee_InternalStateType)
+
+[*] --> FEE_STATE_UNINIT
+
+FEE_STATE_UNINIT --> FEE_STATE_INIT_READ_SECTOR_HEADER : Fee_Init(ConfigPtr)
+
+state "Initialization" as Init {
+    FEE_STATE_INIT_READ_SECTOR_HEADER --> FEE_STATE_INIT_WAIT_SECTOR_HEADER : MemAcc_Read issued
+    FEE_STATE_INIT_WAIT_SECTOR_HEADER --> FEE_STATE_INIT_NEXT_SECTOR : MemAcc result ready
+    FEE_STATE_INIT_NEXT_SECTOR --> FEE_STATE_INIT_READ_SECTOR_HEADER : More sectors
+    FEE_STATE_INIT_NEXT_SECTOR --> FEE_STATE_INIT_SCAN_READ_RECORD : All sectors read
+
+    FEE_STATE_INIT_SCAN_READ_RECORD --> FEE_STATE_INIT_SCAN_WAIT_RECORD : MemAcc_Read issued
+    FEE_STATE_INIT_SCAN_WAIT_RECORD --> FEE_STATE_INIT_SCAN_READ_RECORD : Record parsed, advance cursor
+    FEE_STATE_INIT_SCAN_READ_RECORD --> FEE_STATE_IDLE : Blank area / sector end
+    FEE_STATE_INIT_SCAN_WAIT_RECORD --> FEE_STATE_IDLE : Blank header / read fail
+}
+
+FEE_STATE_IDLE --> FEE_STATE_READ_START : Job.Type == FEE_JOB_READ
+FEE_STATE_IDLE --> FEE_STATE_WRITE_ALLOC : Job.Type == FEE_JOB_WRITE
+FEE_STATE_IDLE --> FEE_STATE_INVALIDATE_WRITE : Job.Type == FEE_JOB_INVALIDATE
+FEE_STATE_IDLE --> FEE_STATE_ERASE_IMMEDIATE : Job.Type == FEE_JOB_ERASE_IMMEDIATE
+
+state "Read Flow" as Read {
+    FEE_STATE_READ_START --> FEE_STATE_READ_WAIT : MemAcc_Read issued
+    FEE_STATE_READ_WAIT --> FEE_STATE_READ_VERIFY_CRC : Read complete
+    FEE_STATE_READ_VERIFY_CRC --> FEE_STATE_IDLE : CRC OK / partial read
+}
+FEE_STATE_READ_START --> FEE_STATE_IDLE : Block not found / invalid
+
+state "Write Flow (Two-Phase Commit)" as Write {
+    FEE_STATE_WRITE_ALLOC --> FEE_STATE_WRITE_HEADER : Space allocated
+    FEE_STATE_WRITE_HEADER --> FEE_STATE_WRITE_HEADER_WAIT : MemAcc_Write issued
+    FEE_STATE_WRITE_HEADER_WAIT --> FEE_STATE_WRITE_DATA : Header written
+    FEE_STATE_WRITE_DATA --> FEE_STATE_WRITE_DATA_WAIT : MemAcc_Write issued
+    FEE_STATE_WRITE_DATA_WAIT --> FEE_STATE_WRITE_VALID : Data written
+    FEE_STATE_WRITE_VALID --> FEE_STATE_WRITE_VALID_WAIT : Valid marker write issued
+    FEE_STATE_WRITE_VALID_WAIT --> FEE_STATE_WRITE_VERIFY_READ : [READ_BACK_VERIFICATION ON]
+    FEE_STATE_WRITE_VALID_WAIT --> FEE_STATE_IDLE : [READ_BACK_VERIFICATION OFF]\nComplete
+    FEE_STATE_WRITE_VERIFY_READ --> FEE_STATE_WRITE_VERIFY_WAIT : MemAcc_Read issued
+    FEE_STATE_WRITE_VERIFY_WAIT --> FEE_STATE_WRITE_VERIFY_COMPARE : Read-back complete
+    FEE_STATE_WRITE_VERIFY_COMPARE --> FEE_STATE_IDLE : Verification OK
+}
+FEE_STATE_WRITE_ALLOC --> FEE_STATE_IDLE : Sector full / invalid block
+
+state "Invalidate Flow" as Invalidate {
+    FEE_STATE_INVALIDATE_WRITE --> FEE_STATE_INVALIDATE_WAIT : MemAcc_Write (0xFF marker)
+    FEE_STATE_INVALIDATE_WAIT --> FEE_STATE_IDLE : Write complete
+}
+
+state "Erase Immediate Flow" as EraseImm {
+    FEE_STATE_ERASE_IMMEDIATE --> FEE_STATE_ERASE_IMMEDIATE_WAIT : Invalidate existing entry
+    FEE_STATE_ERASE_IMMEDIATE_WAIT --> FEE_STATE_IDLE : Complete
+}
+FEE_STATE_ERASE_IMMEDIATE --> FEE_STATE_IDLE : No existing entry
+
+FEE_STATE_GC_ACTIVE --> FEE_STATE_IDLE : GC complete
+FEE_STATE_GC_ACTIVE --> FEE_STATE_ERROR : GC error
+
+FEE_STATE_ERROR --> FEE_STATE_IDLE : DEM reported, transition to idle
+
+note right of FEE_STATE_GC_ACTIVE
+    During GC, immediate jobs can preempt:
+    1. Fee_GarbageCollect_Suspend()
+    2. Process immediate job
+    3. Fee_GarbageCollect_Resume()
+end note
+
+@enduml

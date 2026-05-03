@@ -1,0 +1,92 @@
+@startuml safety_partitioning
+!theme plain
+title Safety Partitioning — ASIL-B Boundary
+
+rectangle "QM Partition (Application)" as QM {
+    component "NvM" as NvM
+    component "SWC" as SWC
+    component "MemIf" as MemIf
+}
+
+rectangle "ASIL-B Partition (BSW)" as ASILB #LightGreen {
+    component "Fee" as Fee {
+        component "Fee.c" as FeeC
+        component "Fee_StateMachine.c" as FeeSM
+        component "Fee_Sector.c" as FeeSec
+        component "Fee_GarbageCollect.c" as FeeGC
+        component "Fee_Crc.c" as FeeCrc
+        component "Fee_Safety.c" as FeeSafety
+    }
+    component "MemAcc" as MemAcc {
+        component "MemAcc.c" as MAC
+        component "MemAcc_JobProcessing.c" as MAJob
+        component "MemAcc_AddressArea.c" as MAAddr
+    }
+    component "Det" as Det
+    component "Dem" as Dem
+    component "SchM" as SchM
+}
+
+rectangle "ASIL-B MCAL Partition" as MCAL #LightCyan {
+    component "Mem_DFLS" as MemDFLS
+}
+
+rectangle "Hardware" as HW #LightGray {
+    component "TC3xx DFLASH" as DFLASH
+    component "TC3xx ECC Unit" as ECC
+    component "TC3xx DMU" as DMU
+}
+
+SWC --> NvM
+NvM --> MemIf
+MemIf --> FeeC
+FeeC --> FeeSM
+FeeSM --> FeeSec
+FeeSM --> FeeGC
+FeeSM --> FeeCrc
+FeeC --> FeeSafety
+FeeSM --> MAC
+MAC --> MAJob
+MAC --> MAAddr
+MAJob --> MemDFLS
+MemDFLS --> DMU
+DMU --> DFLASH
+DFLASH --> ECC
+
+FeeC --> Det
+FeeC --> SchM
+FeeSafety --> Det
+FeeSafety --> Dem
+FeeSM --> Dem
+MAC --> Det
+MAC --> SchM
+MAJob --> Dem
+
+note bottom of ASILB
+    **Safety Mechanisms in ASIL-B Partition:**
+    1. CRC-16 CCITT data integrity (Fee_Crc.c)
+    2. RAM CRC cyclic check (Fee_Safety.c)
+    3. Flow counter monitoring (Fee_Safety.c)
+    4. Two-phase commit protocol (Fee_StateMachine.c)
+    5. Read-back verification (Fee_StateMachine.c)
+    6. DET parameter validation (Fee.c, MemAcc.c)
+    7. DEM production error reporting
+    8. Address bounds validation (MemAcc_AddressArea.c)
+    9. ECC error propagation (MemAcc_JobProcessing.c)
+    
+    **No dynamic memory allocation.**
+    **All buffers statically allocated:**
+    - Fee_Sector_HeaderBuffer[32]
+    - Fee_Sector_WriteBuffer[FEE_MAX_BLOCK_SIZE]
+    - Fee_GcCopyBuffer[FEE_MAX_BLOCK_SIZE]
+    - MemAcc_CompareBuffer[32]
+end note
+
+note top of QM
+    **MPU Configuration Required:**
+    <PLACEHOLDER_REQUIRED>
+    OS must enforce partition
+    boundaries via TC3xx MPU.
+end note
+
+@enduml

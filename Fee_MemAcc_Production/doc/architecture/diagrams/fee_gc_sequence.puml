@@ -1,0 +1,75 @@
+@startuml fee_gc_sequence
+!theme plain
+title Fee Garbage Collection Sequence (with Immediate Preemption)
+
+participant "Fee_StateMachine.c" as SM
+participant "Fee_GarbageCollect.c" as GC
+participant "Fee_Sector.c" as Sec
+participant "Fee_Crc.c" as Crc
+participant "Fee_Safety.c" as Safety
+participant "MemAcc" as MA
+
+== GC Trigger ==
+SM -> GC : Fee_GarbageCollect_Trigger()
+note right : Source = fullest ACTIVE/FULL sector\nTarget = ERASED sector with lowest EraseCount\nFee_GcState = FEE_GC_SELECT_SOURCE
+SM -> SM : Fee_InternalState = FEE_STATE_GC_ACTIVE\nFee_ModuleStatus = MEMIF_BUSY_INTERNAL
+
+== Per-block Copy Loop ==
+loop For each VALID block in source sector
+    SM -> GC : Fee_GarbageCollect_Process()
+    note right : FEE_GC_SELECT_SOURCE\nScan BlockInfoTable for next VALID block in source
+
+    SM -> GC : Fee_GarbageCollect_Process()
+    note right : FEE_GC_COPY_READ
+    GC -> MA : MemAcc_Read(AreaId, block.DataAddress, GcCopyBuffer, DataLength)
+
+    SM -> GC : Fee_GarbageCollect_Process()
+    note right : FEE_GC_COPY_READ_WAIT
+    GC -> MA : MemAcc_GetJobResult(AreaId)
+    GC -> Crc : Fee_Crc_CalculateBlock(GcCopyBuffer, DataLength)
+    note right : Verify CRC matches BlockInfoTable[].DataCrc\nCRC mismatch → mark INCONSISTENT, skip block
+
+    == Immediate Job Preemption Point ==
+    note over SM,GC #LightCoral : If NvM requests immediate write during GC:\n1. Fee_StateMachine_AcceptJob sets Fee_GcSuspended=TRUE\n2. GC returns FEE_GC_IN_PROGRESS without advancing\n3. Fee processes immediate job\n4. On CompleteJob: resumes GC (Fee_GcSuspended=FALSE)
+
+    SM -> GC : Fee_GarbageCollect_Process()
+    note right : FEE_GC_COPY_WRITE_HEADER
+    GC -> Sec : Fee_Sector_AllocateBlock(&SectorInfo[target], BlockSize, VirtualPageSize)
+    GC -> Sec : Fee_Sector_BuildBlockHeader(HeaderBuf, ...)
+    GC -> MA : MemAcc_Write(AreaId, AllocAddress, HeaderBuf, 32)
+
+    SM -> GC : Fee_GarbageCollect_Process()
+    note right : FEE_GC_COPY_WRITE_HEADER_WAIT
+
+    SM -> GC : Fee_GarbageCollect_Process()
+    note right : FEE_GC_COPY_WRITE_DATA
+    GC -> Sec : Fee_Sector_PrepareWriteBuffer(GcCopyBuffer, DataLength, VirtualPageSize)
+    GC -> MA : MemAcc_Write(AreaId, AllocAddress+32, WriteBuf, PaddedLen)
+
+    SM -> GC : Fee_GarbageCollect_Process()
+    note right : FEE_GC_COPY_WRITE_DATA_WAIT
+
+    SM -> GC : Fee_GarbageCollect_Process()
+    note right : FEE_GC_COPY_WRITE_VALID
+    GC -> MA : MemAcc_Write(AreaId, AllocAddress, HeaderBuf[30]=0x55, 32)
+
+    SM -> GC : Fee_GarbageCollect_Process()
+    note right : FEE_GC_COPY_WRITE_VALID_WAIT\nUpdate BlockInfoTable[blkIdx] with new addresses
+    GC -> Safety : Fee_Safety_UpdateRamCrc()
+end
+
+== Erase Source Sector ==
+SM -> GC : Fee_GarbageCollect_Process()
+note right : FEE_GC_ERASE_SOURCE
+GC -> MA : MemAcc_Erase(AreaId, SourceSector.BaseAddress, SectorSize)
+
+SM -> GC : Fee_GarbageCollect_Process()
+note right : FEE_GC_ERASE_WAIT\nIncrement EraseCount\nReset stale BlockInfoTable entries\nSet source sector status = FEE_SECTOR_ERASED
+GC -> Safety : Fee_Safety_UpdateRamCrc()
+
+== GC Complete ==
+SM -> GC : Fee_GarbageCollect_Process()
+note right : FEE_GC_COMPLETE_STATE\nReturns FEE_GC_COMPLETE
+SM -> SM : Fee_InternalState = FEE_STATE_IDLE\nFee_ModuleStatus = MEMIF_IDLE
+
+@enduml

@@ -1,0 +1,86 @@
+@startuml fee_write_sequence
+!theme plain
+title Fee Write Sequence (Two-Phase Commit)
+
+participant "NvM" as NvM
+participant "Fee.c" as Fee
+participant "Fee_StateMachine.c" as SM
+participant "Fee_Sector.c" as Sec
+participant "Fee_Crc.c" as Crc
+participant "Fee_Safety.c" as Safety
+participant "MemAcc" as MA
+
+== Job Acceptance ==
+NvM -> Fee : Fee_Write(BlockNumber, DataBufferPtr)
+activate Fee
+Fee -> Fee : DET validation\n(uninit, null ptr, invalid block)
+Fee -> Fee : Build Fee_JobInfoType\n{Type=FEE_JOB_WRITE, IsImmediate=BlockConfig.ImmediateData}
+Fee -> Fee : SchM_Enter_Fee_FEE_EXCLUSIVE_AREA_0()
+Fee -> SM : Fee_StateMachine_AcceptJob(&job)
+note right : If MEMIF_IDLE: accept, set MEMIF_BUSY\nIf BUSY_INTERNAL + IsImmediate: suspend GC, accept
+Fee -> Fee : SchM_Exit_Fee_FEE_EXCLUSIVE_AREA_0()
+Fee --> NvM : E_OK
+deactivate Fee
+
+== Phase 1: Allocate Space ==
+NvM -> Fee : Fee_MainFunction()
+Fee -> SM : Fee_StateMachine_Process()
+note right : FEE_STATE_WRITE_ALLOC
+SM -> Sec : Fee_Sector_AllocateBlock(&SectorInfo[ActiveSector],\n  BlockSize, VirtualPageSize)
+note right : Returns allocated address\nUpdates WritePointer and FreeSpace\n→ FEE_STATE_WRITE_HEADER
+
+== Phase 1: Write Block Header (ValidMarker = 0x00 = erased) ==
+NvM -> Fee : Fee_MainFunction()
+Fee -> SM : Fee_StateMachine_Process()
+note right : FEE_STATE_WRITE_HEADER
+SM -> Crc : Fee_Crc_CalculateBlock(WriteDataPtr, BlockSize)
+SM -> SM : Fee_BlockSequenceCounters[blkIdx]++
+SM -> Sec : Fee_Sector_BuildBlockHeader(HeaderBuf,\n  BlockNumber, BlockSize, DataCrc, SeqCounter, 0)
+SM -> MA : MemAcc_Write(AreaId, AllocAddress, HeaderBuf, 32)
+note right : → FEE_STATE_WRITE_HEADER_WAIT
+
+== Wait for header write ==
+NvM -> Fee : Fee_MainFunction()
+Fee -> SM : Fee_StateMachine_Process()
+SM -> MA : MemAcc_GetJobResult(AreaId)
+note right : MEMACC_JOB_OK → FEE_STATE_WRITE_DATA\nMEMACC_JOB_FAILED → DEM + CompleteJob(MEMIF_JOB_FAILED)
+
+== Phase 1: Write Block Data (padded to VirtualPageSize) ==
+NvM -> Fee : Fee_MainFunction()
+Fee -> SM : Fee_StateMachine_Process()
+note right : FEE_STATE_WRITE_DATA
+SM -> Sec : Fee_Sector_PrepareWriteBuffer(WriteDataPtr,\n  BlockSize, VirtualPageSize)
+SM -> MA : MemAcc_Write(AreaId, AllocAddress+32, WriteBuf, PaddedLen)
+note right : → FEE_STATE_WRITE_DATA_WAIT
+
+== Wait for data write ==
+NvM -> Fee : Fee_MainFunction()
+Fee -> SM : Fee_StateMachine_Process()
+SM -> MA : MemAcc_GetJobResult(AreaId)
+note right : MEMACC_JOB_OK → FEE_STATE_WRITE_VALID
+
+== Phase 2: Write Valid Marker (0x55) ==
+NvM -> Fee : Fee_MainFunction()
+Fee -> SM : Fee_StateMachine_Process()
+note right : FEE_STATE_WRITE_VALID\nSet HeaderBuf[30] = FEE_MARKER_VALID (0x55)
+SM -> MA : MemAcc_Write(AreaId, AllocAddress, HeaderBuf, 32)
+note right : → FEE_STATE_WRITE_VALID_WAIT
+
+== Wait for valid marker write ==
+NvM -> Fee : Fee_MainFunction()
+Fee -> SM : Fee_StateMachine_Process()
+SM -> MA : MemAcc_GetJobResult(AreaId)
+
+alt FEE_READ_BACK_VERIFICATION == STD_ON
+    note right : → FEE_STATE_WRITE_VERIFY_READ (read-back verification)
+    SM -> MA : MemAcc_Read(AreaId, AllocAddress+32, WriteBuf, PaddedLen)
+    note right : → FEE_STATE_WRITE_VERIFY_WAIT → FEE_STATE_WRITE_VERIFY_COMPARE
+    SM -> SM : Byte-by-byte comparison of read-back vs original
+end
+
+SM -> SM : Update Fee_BlockInfoTable[blkIdx]\n{Status=FEE_BLOCK_VALID, HeaderAddress, DataAddress,\n DataLength, DataCrc, SequenceCounter, SectorIndex}
+SM -> Safety : Fee_Safety_UpdateRamCrc()
+SM -> SM : Fee_StateMachine_CompleteJob(MEMIF_JOB_OK)
+SM -> NvM : NvM_JobEndNotification()
+
+@enduml

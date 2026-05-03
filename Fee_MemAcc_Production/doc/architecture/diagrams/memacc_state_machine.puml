@@ -1,0 +1,42 @@
+@startuml memacc_state_machine
+!theme plain
+title MemAcc Module Status State Machine (MemAcc_StatusType)
+
+[*] --> MEMACC_UNINIT
+
+MEMACC_UNINIT --> MEMACC_IDLE : MemAcc_Init(ConfigPtr)
+
+MEMACC_IDLE --> MEMACC_BUSY : Job accepted\n(Read/Write/Erase/BlankCheck/Compare)
+
+MEMACC_BUSY --> MEMACC_IDLE : Job complete\n(OK/Failed/ECC_CORRECTED/ECC_UNCORRECTED)
+MEMACC_BUSY --> MEMACC_IDLE : MemAcc_Cancel(AreaId)\nMEMACC_JOB_CANCELED
+
+MEMACC_IDLE --> MEMACC_UNINIT : MemAcc_DeInit()
+
+note right of MEMACC_IDLE
+    Per-area status is tracked independently:
+    - MemAcc_AreaBusy[AreaId]
+    - MemAcc_AreaJobResult[AreaId]
+    - MemAcc_AreaLocked[AreaId]
+    
+    Global MemAcc_ModuleStatus reflects
+    overall module state.
+end note
+
+state "Per-Area Job Results" as Results {
+    state MEMACC_JOB_OK : Job completed successfully
+    state MEMACC_JOB_PENDING : Job in progress
+    state MEMACC_JOB_FAILED : Job failed (DEM reported)
+    state MEMACC_JOB_CANCELED : Job canceled by user
+    state MEMACC_JOB_ECC_CORRECTED : Correctable ECC error
+    state MEMACC_JOB_ECC_UNCORRECTED : Uncorrectable ECC error\n(DEM reported)
+}
+
+state "Per-Area Lock" as Lock {
+    state UNLOCKED : MemAcc_AreaLocked[AreaId] == FALSE
+    state LOCKED : MemAcc_AreaLocked[AreaId] == TRUE\nAll job requests rejected
+    UNLOCKED --> LOCKED : MemAcc_RequestLock(AreaId)
+    LOCKED --> UNLOCKED : MemAcc_ReleaseLock(AreaId)
+}
+
+@enduml

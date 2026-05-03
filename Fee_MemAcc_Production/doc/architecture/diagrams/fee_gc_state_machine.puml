@@ -1,0 +1,61 @@
+@startuml fee_gc_state_machine
+!theme plain
+title Fee Garbage Collection State Machine (Fee_GcInternalStateType)
+
+[*] --> FEE_GC_IDLE
+
+FEE_GC_IDLE --> FEE_GC_SELECT_SOURCE : Fee_GarbageCollect_Trigger()\nSource = fullest ACTIVE/FULL\nTarget = ERASED + lowest EraseCount
+
+state "Block Copy Loop" as CopyLoop {
+    FEE_GC_SELECT_SOURCE --> FEE_GC_COPY_READ : Found VALID block\nin source sector
+    FEE_GC_SELECT_SOURCE --> FEE_GC_ERASE_SOURCE : No more VALID blocks
+
+    FEE_GC_COPY_READ --> FEE_GC_COPY_READ_WAIT : MemAcc_Read issued\n(read block data into GcCopyBuffer)
+
+    FEE_GC_COPY_READ_WAIT --> FEE_GC_COPY_WRITE_HEADER : CRC OK
+    FEE_GC_COPY_READ_WAIT --> FEE_GC_SELECT_SOURCE : CRC mismatch\n(mark INCONSISTENT, skip)
+    FEE_GC_COPY_READ_WAIT --> FEE_GC_IDLE : MemAcc failure → ERROR
+
+    FEE_GC_COPY_WRITE_HEADER --> FEE_GC_COPY_WRITE_HEADER_WAIT : AllocateBlock + BuildBlockHeader\n+ MemAcc_Write
+    FEE_GC_COPY_WRITE_HEADER --> FEE_GC_IDLE : Target sector full → ERROR
+
+    FEE_GC_COPY_WRITE_HEADER_WAIT --> FEE_GC_COPY_WRITE_DATA : Write OK
+    FEE_GC_COPY_WRITE_HEADER_WAIT --> FEE_GC_IDLE : Write failure → ERROR
+
+    FEE_GC_COPY_WRITE_DATA --> FEE_GC_COPY_WRITE_DATA_WAIT : PrepareWriteBuffer\n+ MemAcc_Write
+
+    FEE_GC_COPY_WRITE_DATA_WAIT --> FEE_GC_COPY_WRITE_VALID : Write OK
+    FEE_GC_COPY_WRITE_DATA_WAIT --> FEE_GC_IDLE : Write failure → ERROR
+
+    FEE_GC_COPY_WRITE_VALID --> FEE_GC_COPY_WRITE_VALID_WAIT : Write valid marker 0x55\n+ MemAcc_Write
+
+    FEE_GC_COPY_WRITE_VALID_WAIT --> FEE_GC_SELECT_SOURCE : Write OK\nUpdate BlockInfoTable\nFee_Safety_UpdateRamCrc()
+    FEE_GC_COPY_WRITE_VALID_WAIT --> FEE_GC_IDLE : Write failure → ERROR
+}
+
+state "Erase Phase" as Erase {
+    FEE_GC_ERASE_SOURCE --> FEE_GC_ERASE_WAIT : MemAcc_Erase issued
+
+    FEE_GC_ERASE_WAIT --> FEE_GC_COMPLETE_STATE : Erase OK\nIncrement EraseCount\nReset stale entries\nSource → FEE_SECTOR_ERASED
+    FEE_GC_ERASE_WAIT --> FEE_GC_IDLE : Erase failure → ERROR
+}
+
+FEE_GC_COMPLETE_STATE --> FEE_GC_IDLE : Returns FEE_GC_COMPLETE
+
+note right of CopyLoop
+    **Suspension for immediate preemption:**
+    When Fee_GcSuspended == TRUE,
+    Fee_GarbageCollect_Process() returns
+    FEE_GC_IN_PROGRESS without advancing state.
+    
+    States per block: 4 async ops
+    (READ, WRITE_HEADER, WRITE_DATA, WRITE_VALID)
+    + wait states = 8 MainFunction calls/block
+end note
+
+note right of FEE_GC_ERASE_SOURCE
+    Erase failure sets sector to
+    FEE_SECTOR_DEFECTIVE if repeated.
+end note
+
+@enduml

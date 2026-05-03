@@ -1,0 +1,60 @@
+@startuml fee_read_sequence
+!theme plain
+title Fee Read Sequence (with CRC Verification)
+
+participant "NvM" as NvM
+participant "Fee.c" as Fee
+participant "Fee_StateMachine.c" as SM
+participant "Fee_Crc.c" as Crc
+participant "MemAcc" as MA
+
+== Job Acceptance ==
+NvM -> Fee : Fee_Read(BlockNumber, BlockOffset, DataBufferPtr, Length)
+activate Fee
+Fee -> Fee : DET validation\n(uninit, null ptr, invalid block,\n zero length, offset+length > blockSize)
+Fee -> Fee : Build Fee_JobInfoType\n{Type=FEE_JOB_READ, IsImmediate=FALSE}
+Fee -> Fee : SchM_Enter_Fee_FEE_EXCLUSIVE_AREA_0()
+Fee -> SM : Fee_StateMachine_AcceptJob(&job)
+Fee -> Fee : SchM_Exit_Fee_FEE_EXCLUSIVE_AREA_0()
+Fee --> NvM : E_OK
+deactivate Fee
+
+== IDLE → READ_START ==
+NvM -> Fee : Fee_MainFunction()
+Fee -> SM : Fee_StateMachine_Process()
+note right : FEE_STATE_IDLE → FEE_STATE_READ_START\nLookup blkIdx via Fee_Internal_LookupBlockIndex
+alt Block not found / invalid / inconsistent
+    SM -> SM : CompleteJob(MEMIF_BLOCK_INVALID or MEMIF_BLOCK_INCONSISTENT)
+    SM -> NvM : NvM_JobErrorNotification()
+else Block is FEE_BLOCK_VALID
+    SM -> MA : MemAcc_Read(AreaId,\n  BlockInfoTable[blkIdx].DataAddress + BlockOffset,\n  ReadDataPtr, Length)
+    note right : → FEE_STATE_READ_WAIT
+end
+
+== Wait for read ==
+NvM -> Fee : Fee_MainFunction()
+Fee -> SM : Fee_StateMachine_Process()
+SM -> MA : MemAcc_GetJobResult(AreaId)
+note right : MEMACC_JOB_OK → FEE_STATE_READ_VERIFY_CRC\nMEMACC_JOB_FAILED → DEM + CompleteJob(MEMIF_JOB_FAILED)
+
+== CRC Verification ==
+NvM -> Fee : Fee_MainFunction()
+Fee -> SM : Fee_StateMachine_Process()
+note right : FEE_STATE_READ_VERIFY_CRC
+alt Full block read (Offset==0, Length==DataLength)
+    SM -> Crc : Fee_Crc_CalculateBlock(ReadDataPtr, Length)
+    alt CRC matches BlockInfoTable[blkIdx].DataCrc
+        SM -> SM : CompleteJob(MEMIF_JOB_OK)
+        SM -> NvM : NvM_JobEndNotification()
+    else CRC mismatch
+        SM -> SM : DEM report FEE_E_HARDWARE_ERROR
+        SM -> SM : CompleteJob(MEMIF_BLOCK_INCONSISTENT)
+        SM -> NvM : NvM_JobErrorNotification()
+    end
+else Partial read (offset != 0 or length != full block)
+    SM -> SM : CompleteJob(MEMIF_JOB_OK)
+    note right : CRC verification skipped for partial reads
+    SM -> NvM : NvM_JobEndNotification()
+end
+
+@enduml
