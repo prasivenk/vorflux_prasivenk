@@ -36,15 +36,8 @@
  *============================================================================*/
 
 #include "Fee_Sector.h"
+#include "Fee_Internal.h"
 #include "Fee_Crc.h"
-
-/*============================================================================*
- *  Alignment macro
- *============================================================================*/
-
-/** \brief Align value up to the next multiple of alignment */
-#define FEE_ALIGN_UP(value, alignment)  \
-    (((uint32)(value) + ((uint32)(alignment) - 1u)) & ~((uint32)(alignment) - 1u))
 
 /*============================================================================*
  *  Static module-scope buffers
@@ -253,7 +246,7 @@ FUNC(void, FEE_CODE) Fee_Sector_BuildBlockHeader(
     /* SequenceCounter at bytes 6-7 */
     Fee_Sector_WriteLE16(&HeaderBuf[6], SeqCounter);
 
-    /* Reserved bytes 8-27 already 0x00 from memset above */
+    /* Reserved bytes 8-27 already 0x00 from initial clear loop above */
 
     /* WriteCounter at byte 28 */
     HeaderBuf[28] = WriteCount;

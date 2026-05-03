@@ -18,6 +18,7 @@
  *============================================================================*/
 
 #include "Fee.h"
+#include "Fee_Internal.h"
 #include "Fee_StateMachine.h"
 #include "Fee_Safety.h"
 #include "Fee_Cfg.h"

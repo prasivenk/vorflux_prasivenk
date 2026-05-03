@@ -21,39 +21,11 @@
 #include "Fee_Cfg.h"
 #include "Fee_PBcfg.h"
 #include "Fee.h"
+#include "Fee_StateMachine.h"
+#include "Fee_Internal.h"
 
-/*============================================================================*
- *  Helper: Block lookup by number
- *  Searches the config table for a block with the given number.
- *  Returns index or FEE_BLOCK_INDEX_INVALID if not found.
- *============================================================================*/
-
-static uint16 Fee_Test_LookupBlock(
-    P2CONST(Fee_ConfigType, AUTOMATIC, FEE_CONST) ConfigPtr,
-    uint16 BlockNumber
-)
-{
-    uint16 idx;
-
-    if (ConfigPtr == NULL_PTR)
-    {
-        return FEE_BLOCK_INDEX_INVALID;
-    }
-    if (ConfigPtr->BlockConfigTable == NULL_PTR)
-    {
-        return FEE_BLOCK_INDEX_INVALID;
-    }
-
-    for (idx = 0u; idx < ConfigPtr->NumberOfBlocks; idx++)
-    {
-        if (ConfigPtr->BlockConfigTable[idx].BlockNumber == BlockNumber)
-        {
-            return idx;
-        }
-    }
-
-    return FEE_BLOCK_INDEX_INVALID;
-}
+/* Block lookup uses Fee_Internal_FindBlockIndex (defined in Fee.c) which
+ * operates on the global Fee_ConfigPtr.  setUp() points it at Fee_Config. */
 
 /*============================================================================*
  *  Setup / Teardown
@@ -61,7 +33,8 @@ static uint16 Fee_Test_LookupBlock(
 
 void setUp(void)
 {
-    /* No runtime state to reset for configuration-only tests */
+    /* Fee_Internal_FindBlockIndex requires Fee_ConfigPtr */
+    Fee_ConfigPtr = &Fee_Config;
 }
 
 void tearDown(void)
@@ -152,7 +125,7 @@ static void test_BlockLookup_FindsCorrectIndex(void)
     for (idx = 0u; idx < Fee_Config.NumberOfBlocks; idx++)
     {
         uint16 found;
-        found = Fee_Test_LookupBlock(&Fee_Config, idx + 1u);
+        found = Fee_Internal_FindBlockIndex(idx + 1u);
         TEST_ASSERT_EQUAL_UINT16(idx, found);
     }
 }
@@ -166,15 +139,15 @@ static void test_BlockLookup_InvalidBlockNumber(void)
     uint16 found;
 
     /* Block 0 does not exist */
-    found = Fee_Test_LookupBlock(&Fee_Config, 0u);
+    found = Fee_Internal_FindBlockIndex(0u);
     TEST_ASSERT_EQUAL_UINT16(FEE_BLOCK_INDEX_INVALID, found);
 
     /* Block 9 does not exist */
-    found = Fee_Test_LookupBlock(&Fee_Config, 9u);
+    found = Fee_Internal_FindBlockIndex(9u);
     TEST_ASSERT_EQUAL_UINT16(FEE_BLOCK_INDEX_INVALID, found);
 
     /* Block 0xFFFF does not exist */
-    found = Fee_Test_LookupBlock(&Fee_Config, 0xFFFFu);
+    found = Fee_Internal_FindBlockIndex(0xFFFFu);
     TEST_ASSERT_EQUAL_UINT16(FEE_BLOCK_INDEX_INVALID, found);
 }
 
@@ -185,8 +158,13 @@ static void test_BlockLookup_InvalidBlockNumber(void)
 static void test_BlockLookup_NullConfig(void)
 {
     uint16 found;
-    found = Fee_Test_LookupBlock(NULL_PTR, 1u);
+    P2CONST(Fee_ConfigType, AUTOMATIC, FEE_CONST) savedPtr = Fee_ConfigPtr;
+
+    Fee_ConfigPtr = NULL_PTR;
+    found = Fee_Internal_FindBlockIndex(1u);
     TEST_ASSERT_EQUAL_UINT16(FEE_BLOCK_INDEX_INVALID, found);
+
+    Fee_ConfigPtr = savedPtr;
 }
 
 /*============================================================================*
@@ -290,7 +268,6 @@ static void test_BlockInfoType_InitAndReadBack(void)
     info.DataCrc = 0xABCDu;
     info.SequenceCounter = 5u;
     info.SectorIndex = 1u;
-    info.Immediate = FALSE;
 
     TEST_ASSERT_EQUAL(FEE_BLOCK_VALID, info.Status);
     TEST_ASSERT_EQUAL_UINT32(0x1000u, info.HeaderAddress);
@@ -299,7 +276,6 @@ static void test_BlockInfoType_InitAndReadBack(void)
     TEST_ASSERT_EQUAL_UINT16(0xABCDu, info.DataCrc);
     TEST_ASSERT_EQUAL_UINT16(5u, info.SequenceCounter);
     TEST_ASSERT_EQUAL_UINT8(1u, info.SectorIndex);
-    TEST_ASSERT_EQUAL(FALSE, info.Immediate);
 }
 
 /*============================================================================*
@@ -416,8 +392,8 @@ static void test_BlockLookup_ImmediateBlocks(void)
     uint16 idx5;
     uint16 idx6;
 
-    idx5 = Fee_Test_LookupBlock(&Fee_Config, 5u);
-    idx6 = Fee_Test_LookupBlock(&Fee_Config, 6u);
+    idx5 = Fee_Internal_FindBlockIndex(5u);
+    idx6 = Fee_Internal_FindBlockIndex(6u);
 
     TEST_ASSERT_NOT_EQUAL(FEE_BLOCK_INDEX_INVALID, idx5);
     TEST_ASSERT_NOT_EQUAL(FEE_BLOCK_INDEX_INVALID, idx6);

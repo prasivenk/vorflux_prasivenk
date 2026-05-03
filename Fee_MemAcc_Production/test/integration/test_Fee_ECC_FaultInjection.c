@@ -26,6 +26,7 @@
 #include "Mem_DFLS_Stub.h"
 #include "SchM_Stub.h"
 #include "NvM_Cbk_Stub.h"
+#include "test_Fee_Helpers.h"
 #include <string.h>
 
 /*============================================================================*
@@ -35,32 +36,8 @@
 #define MAX_CYCLES         200u
 #define FLASH_BASE         0xAF000000u
 
-/*============================================================================*
- *  Helpers
- *============================================================================*/
-
-static void DriveOneCycle(void) { MemAcc_MainFunction(); Fee_MainFunction(); }
-
-static void DriveInitToCompletion(void)
-{
-    uint32 cycle;
-    Fee_Init(&Fee_Config);
-    for (cycle = 0u; cycle < MAX_CYCLES; cycle++)
-    {
-        DriveOneCycle();
-        if (Fee_GetStatus() == MEMIF_IDLE) { break; }
-    }
-}
-
-static void DriveJobToCompletion(void)
-{
-    uint32 cycle;
-    for (cycle = 0u; cycle < MAX_CYCLES; cycle++)
-    {
-        DriveOneCycle();
-        if (Fee_GetStatus() == MEMIF_IDLE) { break; }
-    }
-}
+/* DriveOneCycle, DriveInitToCompletion, DriveJobToCompletion
+ * are provided by test_Fee_Helpers. */
 
 /*============================================================================*
  *  Setup / Teardown

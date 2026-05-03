@@ -16,6 +16,7 @@
 
 #include "unity/unity.h"
 #include "MemAcc.h"
+#include "MemAcc_Internal.h"
 #include "MemAcc_Types.h"
 #include "MemAcc_Cfg.h"
 #include "Det_Stub.h"

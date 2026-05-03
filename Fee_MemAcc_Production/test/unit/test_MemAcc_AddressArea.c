@@ -14,6 +14,7 @@
 
 #include "unity/unity.h"
 #include "MemAcc.h"
+#include "MemAcc_Internal.h"
 #include "MemAcc_Types.h"
 #include "MemAcc_Cfg.h"
 #include "Det_Stub.h"
@@ -166,9 +167,9 @@ static void test_TranslateAddress_InvalidArea(void)
 static void test_FindArea_Valid(void)
 {
     boolean found;
-    found = MemAcc_Internal_FindArea(0u);
+    found = MemAcc_Internal_FindArea(0u, NULL_PTR);
     TEST_ASSERT_TRUE(found);
-    found = MemAcc_Internal_FindArea(1u);
+    found = MemAcc_Internal_FindArea(1u, NULL_PTR);
     TEST_ASSERT_TRUE(found);
 }
 
@@ -179,9 +180,9 @@ static void test_FindArea_Valid(void)
 static void test_FindArea_Invalid(void)
 {
     boolean found;
-    found = MemAcc_Internal_FindArea(2u);
+    found = MemAcc_Internal_FindArea(2u, NULL_PTR);
     TEST_ASSERT_FALSE(found);
-    found = MemAcc_Internal_FindArea(255u);
+    found = MemAcc_Internal_FindArea(255u, NULL_PTR);
     TEST_ASSERT_FALSE(found);
 }
 

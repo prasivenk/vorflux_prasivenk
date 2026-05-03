@@ -35,6 +35,7 @@ typedef enum
     FEE_STATE_INIT_NEXT_SECTOR          = 3,
     FEE_STATE_INIT_SCAN_READ_RECORD     = 4,
     FEE_STATE_INIT_SCAN_WAIT_RECORD     = 5,
+    /* Reserved for future data-verification during init scan */
     FEE_STATE_INIT_SCAN_READ_DATA       = 6,
     FEE_STATE_INIT_SCAN_WAIT_DATA       = 7,
     FEE_STATE_INIT_SCAN_NEXT_RECORD     = 8,

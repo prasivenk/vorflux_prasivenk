@@ -27,30 +27,10 @@
 #include "Mem_DFLS_Stub.h"
 #include "SchM_Stub.h"
 #include "NvM_Cbk_Stub.h"
+#include "test_Fee_Helpers.h"
 #include <string.h>
 
-/*============================================================================*
- *  Helper: drive init to completion
- *============================================================================*/
-
-static void DriveInitToCompletion(void)
-{
-    uint32 maxCycles = 200u;
-    uint32 cycle;
-
-    Fee_Init(&Fee_Config);
-
-    for (cycle = 0u; cycle < maxCycles; cycle++)
-    {
-        MemAcc_MainFunction();
-        Fee_MainFunction();
-
-        if (Fee_GetStatus() == MEMIF_IDLE)
-        {
-            break;
-        }
-    }
-}
+/* DriveInitToCompletion is provided by test_Fee_Helpers. */
 
 /*============================================================================*
  *  Setup / Teardown

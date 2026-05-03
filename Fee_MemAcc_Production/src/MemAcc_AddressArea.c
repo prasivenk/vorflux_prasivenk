@@ -3,7 +3,9 @@
  * \brief      AUTOSAR MemAcc Module -- Address Area Management
  *
  * \details    Implements address validation, translation, and area lookup
- *             functions for the MemAcc module.
+ *             functions for the MemAcc module. Area IDs are mapped to
+ *             configuration indices via the configured AreaId field,
+ *             supporting non-dense / non-zero-based area identifiers.
  *
  * \copyright  Copyright (c) 2024 -- All rights reserved.
  *             AUTOSAR R24-11 compliant.
@@ -17,6 +19,7 @@
  *============================================================================*/
 
 #include "MemAcc.h"
+#include "MemAcc_Internal.h"
 #include "MemAcc_Cfg.h"
 
 /*============================================================================*
@@ -25,6 +28,45 @@
 
 #define MEMACC_START_SEC_CODE
 #include "MemAcc_MemMap.h"
+
+/**
+ * \brief  Find address area config index by area ID
+ *
+ * \details Maps the configured AreaId to an internal config array index.
+ *          Supports non-dense and non-zero-based area identifiers by
+ *          searching the AddressAreas[i].AreaId field.
+ *
+ * \param[in]  AreaId    Address area identifier
+ * \param[out] OutIndex  Pointer to store the resolved config index (may be NULL)
+ *
+ * \return    TRUE if area exists, FALSE otherwise
+ */
+FUNC(boolean, MEMACC_CODE) MemAcc_Internal_FindArea(
+    MemAcc_AddressAreaIdType AreaId,
+    P2VAR(uint8, AUTOMATIC, MEMACC_VAR) OutIndex
+)
+{
+    uint8 idx;
+
+    if (MemAcc_ConfigPtr == NULL_PTR)
+    {
+        return FALSE;
+    }
+
+    for (idx = 0u; idx < MemAcc_ConfigPtr->NumberOfAreas; idx++)
+    {
+        if (MemAcc_ConfigPtr->AddressAreas[idx].AreaId == AreaId)
+        {
+            if (OutIndex != NULL_PTR)
+            {
+                *OutIndex = idx;
+            }
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
 
 /**
  * \brief  Validate address and length within area bounds
@@ -43,18 +85,14 @@ FUNC(boolean, MEMACC_CODE) MemAcc_Internal_ValidateAddress(
 {
     MemAcc_LengthType areaLength;
     MemAcc_AddressType endAddress;
+    uint8 areaIndex;
 
-    if (MemAcc_ConfigPtr == NULL_PTR)
+    if (MemAcc_Internal_FindArea(AreaId, &areaIndex) == FALSE)
     {
         return FALSE;
     }
 
-    if (AreaId >= MemAcc_ConfigPtr->NumberOfAreas)
-    {
-        return FALSE;
-    }
-
-    areaLength = MemAcc_ConfigPtr->AddressAreas[AreaId].Length;
+    areaLength = MemAcc_ConfigPtr->AddressAreas[areaIndex].Length;
 
     /* Check for overflow */
     endAddress = Address + Length;
@@ -85,44 +123,16 @@ FUNC(MemAcc_AddressType, MEMACC_CODE) MemAcc_Internal_TranslateAddress(
 )
 {
     MemAcc_AddressType baseAddress;
+    uint8 areaIndex;
 
-    if (MemAcc_ConfigPtr == NULL_PTR)
+    if (MemAcc_Internal_FindArea(AreaId, &areaIndex) == FALSE)
     {
         return 0u;
     }
 
-    if (AreaId >= MemAcc_ConfigPtr->NumberOfAreas)
-    {
-        return 0u;
-    }
-
-    baseAddress = MemAcc_ConfigPtr->AddressAreas[AreaId].StartAddress;
+    baseAddress = MemAcc_ConfigPtr->AddressAreas[areaIndex].StartAddress;
 
     return baseAddress + LogicalAddress;
-}
-
-/**
- * \brief  Check if area ID is valid
- *
- * \param[in] AreaId  Address area identifier
- *
- * \return    TRUE if area exists, FALSE otherwise
- */
-FUNC(boolean, MEMACC_CODE) MemAcc_Internal_FindArea(
-    MemAcc_AddressAreaIdType AreaId
-)
-{
-    if (MemAcc_ConfigPtr == NULL_PTR)
-    {
-        return FALSE;
-    }
-
-    if (AreaId >= MemAcc_ConfigPtr->NumberOfAreas)
-    {
-        return FALSE;
-    }
-
-    return TRUE;
 }
 
 #define MEMACC_STOP_SEC_CODE

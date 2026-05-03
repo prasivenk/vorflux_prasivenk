@@ -29,6 +29,7 @@
 #include "Mem_DFLS_Stub.h"
 #include "SchM_Stub.h"
 #include "NvM_Cbk_Stub.h"
+#include "test_Fee_Helpers.h"
 #include <string.h>
 
 /*============================================================================*
@@ -47,71 +48,8 @@
 /** \brief Virtual page size */
 #define TEST_PAGE_SIZE       FEE_VIRTUAL_PAGE_SIZE   /* 32 */
 
-/*============================================================================*
- *  Helper: drive one main cycle (MemAcc + Fee)
- *============================================================================*/
-
-static void DriveOneCycle(void)
-{
-    MemAcc_MainFunction();
-    Fee_MainFunction();
-}
-
-/*============================================================================*
- *  Helper: drive init to completion
- *============================================================================*/
-
-static void DriveInitToCompletion(void)
-{
-    uint32 maxCycles = 200u;
-    uint32 cycle;
-
-    Fee_Init(&Fee_Config);
-
-    for (cycle = 0u; cycle < maxCycles; cycle++)
-    {
-        DriveOneCycle();
-        if (Fee_GetStatus() == MEMIF_IDLE)
-        {
-            break;
-        }
-    }
-}
-
-/*============================================================================*
- *  Helper: build a sector header in flash at given offset
- *============================================================================*/
-
-static void PlaceSectorHeader(uint32 flashOffset, uint32 seqNum, uint16 eraseCount)
-{
-    uint8 hdr[32];
-    uint8 *flash = Mem_DFLS_Stub_GetFlashContent();
-
-    Fee_Sector_BuildSectorHeader(hdr, seqNum, eraseCount);
-    memcpy(&flash[flashOffset], hdr, 32);
-}
-
-/*============================================================================*
- *  Helper: build a block header + data in flash
- *============================================================================*/
-
-static void PlaceBlockInFlash(uint32 flashOffset, uint16 blockNum, uint16 blockSize,
-                               const uint8 *data, uint16 seqCounter,
-                               uint8 validMarker)
-{
-    uint8 hdr[32];
-    uint8 *flash = Mem_DFLS_Stub_GetFlashContent();
-    uint16 dataCrc;
-
-    dataCrc = Fee_Crc_CalculateBlock(data, (uint32)blockSize);
-
-    Fee_Sector_BuildBlockHeader(hdr, blockNum, blockSize, dataCrc, seqCounter, 0u);
-    /* Set valid marker */
-    hdr[30] = validMarker;
-
-    memcpy(&flash[flashOffset], hdr, 32);
-    memcpy(&flash[flashOffset + 32], data, blockSize);
-}
+/* DriveOneCycle, DriveInitToCompletion, PlaceSectorHeader, PlaceBlockInFlash
+ * are provided by test_Fee_Helpers (linked via test_helpers object library). */
 
 /*============================================================================*
  *  Helper: drive a single GC step (MemAcc_MainFunction + GC_Process)
@@ -1177,21 +1115,32 @@ static void test_GC_StateTransitions_OnePerCall(void)
     result = Fee_GarbageCollect_Process();
     TEST_ASSERT_EQUAL(FEE_GC_IN_PROGRESS, result);
 
-    /* 10. SELECT_SOURCE: no more valid blocks -> ERASE_SOURCE */
+    /* 10. SELECT_SOURCE: no more valid blocks -> WRITE_TARGET_HEADER */
     result = Fee_GarbageCollect_Process();
     TEST_ASSERT_EQUAL(FEE_GC_IN_PROGRESS, result);
 
-    /* 11. ERASE_SOURCE: initiate erase */
+    /* 11. WRITE_TARGET_HEADER: write target sector header */
+    result = Fee_GarbageCollect_Process();
+    TEST_ASSERT_EQUAL(FEE_GC_IN_PROGRESS, result);
+
+    /* Drive MemAcc to complete the header write */
+    MemAcc_MainFunction();
+
+    /* 12. WRITE_TARGET_HEADER_WAIT: poll OK, set target ACTIVE -> ERASE_SOURCE */
+    result = Fee_GarbageCollect_Process();
+    TEST_ASSERT_EQUAL(FEE_GC_IN_PROGRESS, result);
+
+    /* 13. ERASE_SOURCE: initiate erase */
     result = Fee_GarbageCollect_Process();
     TEST_ASSERT_EQUAL(FEE_GC_IN_PROGRESS, result);
 
     MemAcc_MainFunction();
 
-    /* 12. ERASE_WAIT: poll OK, cleanup -> COMPLETE_STATE */
+    /* 14. ERASE_WAIT: poll OK, cleanup -> COMPLETE_STATE */
     result = Fee_GarbageCollect_Process();
     TEST_ASSERT_EQUAL(FEE_GC_IN_PROGRESS, result);
 
-    /* 13. COMPLETE_STATE: return COMPLETE */
+    /* 15. COMPLETE_STATE: return COMPLETE */
     result = Fee_GarbageCollect_Process();
     TEST_ASSERT_EQUAL(FEE_GC_COMPLETE, result);
 }

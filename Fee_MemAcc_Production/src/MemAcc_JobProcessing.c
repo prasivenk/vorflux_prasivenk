@@ -17,12 +17,12 @@
  *============================================================================*/
 
 #include "MemAcc.h"
+#include "MemAcc_Internal.h"
 #include "MemAcc_Cfg.h"
 #include "Mem_DFLS.h"
 #include "Det.h"
 #include "Dem.h"
 #include "SchM_MemAcc.h"
-#include <string.h>
 
 /*============================================================================*
  *  Internal buffer for compare operations
@@ -46,19 +46,23 @@ static VAR(uint8, MEMACC_VAR) MemAcc_CompareBuffer[MEMACC_COMPARE_BUFFER_SIZE];
 
 /**
  * \brief  Dispatch job to underlying Mem driver
+ *
+ * \param[in] AreaIndex  Internal config array index
  */
 FUNC(Std_ReturnType, MEMACC_CODE) MemAcc_Internal_DispatchToMemDriver(
-    MemAcc_AddressAreaIdType AreaId
+    uint8 AreaIndex
 )
 {
     Std_ReturnType retVal = E_NOT_OK;
     MemAcc_AddressType physAddr;
     MemAcc_JobType jobType;
     MemAcc_LengthType length;
+    MemAcc_AddressAreaIdType areaId;
 
-    jobType = MemAcc_CurrentJob[AreaId].JobType;
-    physAddr = MemAcc_Internal_TranslateAddress(AreaId, MemAcc_CurrentJob[AreaId].Address);
-    length = MemAcc_CurrentJob[AreaId].Length;
+    jobType = MemAcc_CurrentJob[AreaIndex].JobType;
+    areaId = MemAcc_CurrentJob[AreaIndex].AreaId;
+    physAddr = MemAcc_Internal_TranslateAddress(areaId, MemAcc_CurrentJob[AreaIndex].Address);
+    length = MemAcc_CurrentJob[AreaIndex].Length;
 
     switch (jobType)
     {
@@ -66,7 +70,7 @@ FUNC(Std_ReturnType, MEMACC_CODE) MemAcc_Internal_DispatchToMemDriver(
         {
             /* Need non-volatile local copy for Mem_DFLS call */
             P2VAR(uint8, AUTOMATIC, MEMACC_APPL_DATA) readPtr;
-            readPtr = MemAcc_CurrentJob[AreaId].ReadDataPtr;
+            readPtr = MemAcc_CurrentJob[AreaIndex].ReadDataPtr;
             retVal = Mem_DFLS_Read(physAddr, readPtr, length);
             break;
         }
@@ -74,7 +78,7 @@ FUNC(Std_ReturnType, MEMACC_CODE) MemAcc_Internal_DispatchToMemDriver(
         {
             /* Need non-volatile local copy for Mem_DFLS call */
             P2CONST(uint8, AUTOMATIC, MEMACC_APPL_DATA) writePtr;
-            writePtr = MemAcc_CurrentJob[AreaId].WriteDataPtr;
+            writePtr = MemAcc_CurrentJob[AreaIndex].WriteDataPtr;
             retVal = Mem_DFLS_Write(physAddr, writePtr, length);
             break;
         }
@@ -107,7 +111,7 @@ FUNC(Std_ReturnType, MEMACC_CODE) MemAcc_Internal_DispatchToMemDriver(
  *          with CompareDataPtr.
  */
 static FUNC(void, MEMACC_CODE) MemAcc_Internal_ProcessCompare(
-    MemAcc_AddressAreaIdType AreaId
+    uint8 AreaIndex
 )
 {
     MemAcc_AddressType physAddr;
@@ -119,19 +123,17 @@ static FUNC(void, MEMACC_CODE) MemAcc_Internal_ProcessCompare(
     Mem_DFLS_JobResultType driverResult;
     P2CONST(uint8, AUTOMATIC, MEMACC_APPL_DATA) comparePtr;
     boolean mismatchFound = FALSE;
+    MemAcc_AddressAreaIdType areaId;
 
-    processed = MemAcc_CurrentJob[AreaId].ProcessedLength;
-    remaining = MemAcc_CurrentJob[AreaId].Length - processed;
-    comparePtr = MemAcc_CurrentJob[AreaId].CompareDataPtr;
+    processed = MemAcc_CurrentJob[AreaIndex].ProcessedLength;
+    remaining = MemAcc_CurrentJob[AreaIndex].Length - processed;
+    comparePtr = MemAcc_CurrentJob[AreaIndex].CompareDataPtr;
+    areaId = MemAcc_CurrentJob[AreaIndex].AreaId;
 
     if (remaining == 0u)
     {
         /* Compare complete */
-        SchM_Enter_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
-        MemAcc_AreaJobResult[AreaId] = MEMACC_JOB_OK;
-        MemAcc_AreaBusy[AreaId] = FALSE;
-        MemAcc_CurrentJob[AreaId].JobType = MEMACC_JOB_NONE;
-        SchM_Exit_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
+        MemAcc_Internal_FinishJob(AreaIndex, MEMACC_JOB_OK);
         return;
     }
 
@@ -141,18 +143,14 @@ static FUNC(void, MEMACC_CODE) MemAcc_Internal_ProcessCompare(
         chunkSize = MEMACC_COMPARE_BUFFER_SIZE;
     }
 
-    physAddr = MemAcc_Internal_TranslateAddress(AreaId,
-        MemAcc_CurrentJob[AreaId].Address + processed);
+    physAddr = MemAcc_Internal_TranslateAddress(areaId,
+        MemAcc_CurrentJob[AreaIndex].Address + processed);
 
     /* Initiate synchronous-style read: dispatch and immediately poll */
     readResult = Mem_DFLS_Read(physAddr, MemAcc_CompareBuffer, chunkSize);
     if (readResult != E_OK)
     {
-        SchM_Enter_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
-        MemAcc_AreaJobResult[AreaId] = MEMACC_JOB_FAILED;
-        MemAcc_AreaBusy[AreaId] = FALSE;
-        MemAcc_CurrentJob[AreaId].JobType = MEMACC_JOB_NONE;
-        SchM_Exit_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
+        MemAcc_Internal_FinishJob(AreaIndex, MEMACC_JOB_FAILED);
         return;
     }
 
@@ -162,33 +160,21 @@ static FUNC(void, MEMACC_CODE) MemAcc_Internal_ProcessCompare(
 
     if (driverResult == MEM_DFLS_JOB_ECC_CORRECTED)
     {
-        SchM_Enter_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
-        MemAcc_AreaJobResult[AreaId] = MEMACC_JOB_ECC_CORRECTED;
-        MemAcc_AreaBusy[AreaId] = FALSE;
-        MemAcc_CurrentJob[AreaId].JobType = MEMACC_JOB_NONE;
-        SchM_Exit_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
+        MemAcc_Internal_FinishJob(AreaIndex, MEMACC_JOB_ECC_CORRECTED);
         return;
     }
 
     if (driverResult == MEM_DFLS_JOB_ECC_UNCORRECTED)
     {
         (void)Dem_SetEventStatus(MEMACC_E_HARDWARE_ERROR, DEM_EVENT_STATUS_FAILED);
-        SchM_Enter_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
-        MemAcc_AreaJobResult[AreaId] = MEMACC_JOB_ECC_UNCORRECTED;
-        MemAcc_AreaBusy[AreaId] = FALSE;
-        MemAcc_CurrentJob[AreaId].JobType = MEMACC_JOB_NONE;
-        SchM_Exit_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
+        MemAcc_Internal_FinishJob(AreaIndex, MEMACC_JOB_ECC_UNCORRECTED);
         return;
     }
 
     if (driverResult != MEM_DFLS_JOB_OK)
     {
         (void)Dem_SetEventStatus(MEMACC_E_HARDWARE_ERROR, DEM_EVENT_STATUS_FAILED);
-        SchM_Enter_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
-        MemAcc_AreaJobResult[AreaId] = MEMACC_JOB_FAILED;
-        MemAcc_AreaBusy[AreaId] = FALSE;
-        MemAcc_CurrentJob[AreaId].JobType = MEMACC_JOB_NONE;
-        SchM_Exit_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
+        MemAcc_Internal_FinishJob(AreaIndex, MEMACC_JOB_FAILED);
         return;
     }
 
@@ -205,27 +191,21 @@ static FUNC(void, MEMACC_CODE) MemAcc_Internal_ProcessCompare(
     if (mismatchFound == TRUE)
     {
         SchM_Enter_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
-        MemAcc_CurrentJob[AreaId].ProcessedLength = processed + idx;
-        MemAcc_AreaJobResult[AreaId] = MEMACC_JOB_FAILED;
-        MemAcc_AreaBusy[AreaId] = FALSE;
-        MemAcc_CurrentJob[AreaId].JobType = MEMACC_JOB_NONE;
+        MemAcc_CurrentJob[AreaIndex].ProcessedLength = processed + idx;
         SchM_Exit_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
+        MemAcc_Internal_FinishJob(AreaIndex, MEMACC_JOB_FAILED);
         return;
     }
 
     /* Chunk matched, update processed length */
     SchM_Enter_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
-    MemAcc_CurrentJob[AreaId].ProcessedLength = processed + chunkSize;
+    MemAcc_CurrentJob[AreaIndex].ProcessedLength = processed + chunkSize;
     SchM_Exit_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
 
     /* If all bytes compared, mark complete */
-    if ((processed + chunkSize) >= MemAcc_CurrentJob[AreaId].Length)
+    if ((processed + chunkSize) >= MemAcc_CurrentJob[AreaIndex].Length)
     {
-        SchM_Enter_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
-        MemAcc_AreaJobResult[AreaId] = MEMACC_JOB_OK;
-        MemAcc_AreaBusy[AreaId] = FALSE;
-        MemAcc_CurrentJob[AreaId].JobType = MEMACC_JOB_NONE;
-        SchM_Exit_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
+        MemAcc_Internal_FinishJob(AreaIndex, MEMACC_JOB_OK);
     }
 }
 
@@ -272,40 +252,28 @@ FUNC(void, MEMACC_CODE) MemAcc_MainFunction(void)
                 SchM_Enter_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
                 MemAcc_CurrentJob[areaIdx].ProcessedLength =
                     MemAcc_CurrentJob[areaIdx].Length;
-                MemAcc_AreaJobResult[areaIdx] = MEMACC_JOB_OK;
-                MemAcc_AreaBusy[areaIdx] = FALSE;
-                MemAcc_CurrentJob[areaIdx].JobType = MEMACC_JOB_NONE;
                 SchM_Exit_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
+                MemAcc_Internal_FinishJob(areaIdx, MEMACC_JOB_OK);
                 break;
 
             case MEM_DFLS_JOB_FAILED:
                 (void)Dem_SetEventStatus(MEMACC_E_HARDWARE_ERROR,
                                          DEM_EVENT_STATUS_FAILED);
-                SchM_Enter_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
-                MemAcc_AreaJobResult[areaIdx] = MEMACC_JOB_FAILED;
-                MemAcc_AreaBusy[areaIdx] = FALSE;
-                MemAcc_CurrentJob[areaIdx].JobType = MEMACC_JOB_NONE;
-                SchM_Exit_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
+                MemAcc_Internal_FinishJob(areaIdx, MEMACC_JOB_FAILED);
                 break;
 
             case MEM_DFLS_JOB_ECC_CORRECTED:
                 SchM_Enter_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
                 MemAcc_CurrentJob[areaIdx].ProcessedLength =
                     MemAcc_CurrentJob[areaIdx].Length;
-                MemAcc_AreaJobResult[areaIdx] = MEMACC_JOB_ECC_CORRECTED;
-                MemAcc_AreaBusy[areaIdx] = FALSE;
-                MemAcc_CurrentJob[areaIdx].JobType = MEMACC_JOB_NONE;
                 SchM_Exit_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
+                MemAcc_Internal_FinishJob(areaIdx, MEMACC_JOB_ECC_CORRECTED);
                 break;
 
             case MEM_DFLS_JOB_ECC_UNCORRECTED:
                 (void)Dem_SetEventStatus(MEMACC_E_HARDWARE_ERROR,
                                          DEM_EVENT_STATUS_FAILED);
-                SchM_Enter_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
-                MemAcc_AreaJobResult[areaIdx] = MEMACC_JOB_ECC_UNCORRECTED;
-                MemAcc_AreaBusy[areaIdx] = FALSE;
-                MemAcc_CurrentJob[areaIdx].JobType = MEMACC_JOB_NONE;
-                SchM_Exit_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
+                MemAcc_Internal_FinishJob(areaIdx, MEMACC_JOB_ECC_UNCORRECTED);
                 break;
 
             default:

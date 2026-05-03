@@ -93,7 +93,6 @@ typedef struct
     uint16              DataCrc;          /**< CRC-16 of block data */
     uint16              SequenceCounter;  /**< Write sequence counter */
     uint8               SectorIndex;      /**< Sector containing the block */
-    boolean             Immediate;        /**< Immediate data flag */
 } Fee_BlockInfoType;
 
 /*============================================================================*

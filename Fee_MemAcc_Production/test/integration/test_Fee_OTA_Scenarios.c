@@ -28,6 +28,7 @@
 #include "Mem_DFLS_Stub.h"
 #include "SchM_Stub.h"
 #include "NvM_Cbk_Stub.h"
+#include "test_Fee_Helpers.h"
 #include <string.h>
 
 /*============================================================================*
@@ -39,49 +40,8 @@
 #define TEST_SECTOR_HDR  FEE_SECTOR_HEADER_SIZE
 #define TEST_BLOCK_HDR   FEE_BLOCK_HEADER_SIZE
 
-static void DriveOneCycle(void) { MemAcc_MainFunction(); Fee_MainFunction(); }
-
-static void DriveInitToCompletion(void)
-{
-    uint32 cycle;
-    Fee_Init(&Fee_Config);
-    for (cycle = 0u; cycle < MAX_CYCLES; cycle++)
-    {
-        DriveOneCycle();
-        if (Fee_GetStatus() == MEMIF_IDLE) { break; }
-    }
-}
-
-static void DriveJobToCompletion(void)
-{
-    uint32 cycle;
-    for (cycle = 0u; cycle < MAX_CYCLES; cycle++)
-    {
-        DriveOneCycle();
-        if (Fee_GetStatus() == MEMIF_IDLE) { break; }
-    }
-}
-
-static void PlaceSectorHeader(uint32 flashOffset, uint32 seqNum, uint16 eraseCount)
-{
-    uint8 hdr[32];
-    uint8 *flash = Mem_DFLS_Stub_GetFlashContent();
-    Fee_Sector_BuildSectorHeader(hdr, seqNum, eraseCount);
-    memcpy(&flash[flashOffset], hdr, 32);
-}
-
-static void PlaceBlockInFlash(uint32 flashOffset, uint16 blockNum, uint16 blockSize,
-                               const uint8 *data, uint16 seqCounter, uint8 validMarker)
-{
-    uint8 hdr[32];
-    uint8 *flash = Mem_DFLS_Stub_GetFlashContent();
-    uint16 dataCrc;
-    dataCrc = Fee_Crc_CalculateBlock(data, (uint32)blockSize);
-    Fee_Sector_BuildBlockHeader(hdr, blockNum, blockSize, dataCrc, seqCounter, 0u);
-    hdr[30] = validMarker;
-    memcpy(&flash[flashOffset], hdr, 32);
-    memcpy(&flash[flashOffset + 32], data, blockSize);
-}
+/* DriveOneCycle, DriveInitToCompletion, DriveJobToCompletion,
+ * PlaceSectorHeader, PlaceBlockInFlash are provided by test_Fee_Helpers. */
 
 static void ReInitFee(void)
 {

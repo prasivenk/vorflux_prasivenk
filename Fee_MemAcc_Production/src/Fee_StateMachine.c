@@ -19,6 +19,7 @@
  *============================================================================*/
 
 #include "Fee_StateMachine.h"
+#include "Fee_Internal.h"
 #include "Fee_Sector.h"
 #include "Fee_Crc.h"
 #include "Fee_Safety.h"
@@ -27,14 +28,6 @@
 #include "Det.h"
 #include "Dem.h"
 #include "Fee_Cfg.h"
-#include <string.h>
-
-/*============================================================================*
- *  Alignment macro
- *============================================================================*/
-
-#define FEE_ALIGN_UP(value, alignment)  \
-    (((uint32)(value) + ((uint32)(alignment) - 1u)) & ~((uint32)(alignment) - 1u))
 
 /*============================================================================*
  *  Module state variables (volatile, in VAR_CLEARED sections)
@@ -88,8 +81,14 @@ static volatile VAR(uint16, FEE_VAR) Fee_WriteDataCrc = 0u;
 /** \brief Padded data length for write */
 static volatile VAR(uint16, FEE_VAR) Fee_WritePaddedLength = 0u;
 
-/** \brief GC was suspended for immediate job */
-static volatile VAR(boolean, FEE_VAR) Fee_GcSuspended = FALSE;
+/** \brief GC was suspended for immediate job preemption in state machine */
+static volatile VAR(boolean, FEE_VAR) Fee_SM_GcSuspended = FALSE;
+
+/** \brief Write job is pending resumption after GC completes */
+static volatile VAR(boolean, FEE_VAR) Fee_WriteAfterGcPending = FALSE;
+
+/** \brief Sector scan cursor during multi-sector init scan */
+static volatile VAR(uint8, FEE_VAR) Fee_InitScanSectorCursor = 0u;
 
 #define FEE_STOP_SEC_VAR_CLEARED_UNSPECIFIED
 #include "Fee_MemMap.h"
@@ -100,30 +99,6 @@ static volatile VAR(boolean, FEE_VAR) Fee_GcSuspended = FALSE;
 
 #define FEE_START_SEC_CODE
 #include "Fee_MemMap.h"
-
-/*============================================================================*
- *  Internal helper: find block index by block number
- *============================================================================*/
-
-static FUNC(uint16, FEE_CODE) Fee_Internal_LookupBlockIndex(uint16 BlockNumber)
-{
-    uint16 idx;
-
-    if (Fee_ConfigPtr == NULL_PTR)
-    {
-        return FEE_BLOCK_INDEX_INVALID;
-    }
-
-    for (idx = 0u; idx < Fee_ConfigPtr->NumberOfBlocks; idx++)
-    {
-        if (Fee_ConfigPtr->BlockConfigTable[idx].BlockNumber == BlockNumber)
-        {
-            return idx;
-        }
-    }
-
-    return FEE_BLOCK_INDEX_INVALID;
-}
 
 /*============================================================================*
  *  Internal helper: check if header buffer is all blank (erased = 0x00)
@@ -158,7 +133,9 @@ FUNC(void, FEE_CODE) Fee_StateMachine_Init(
     Fee_InitSectorCursor = 0u;
     Fee_ScanRecordCursor = 0u;
     Fee_ActiveSectorIndex = 0u;
-    Fee_GcSuspended = FALSE;
+    Fee_SM_GcSuspended = FALSE;
+    Fee_WriteAfterGcPending = FALSE;
+    Fee_InitScanSectorCursor = 0u;
     Fee_WriteAllocAddress = 0u;
     Fee_CurrentBlockIndex = FEE_BLOCK_INDEX_INVALID;
 
@@ -172,7 +149,6 @@ FUNC(void, FEE_CODE) Fee_StateMachine_Init(
         Fee_BlockInfoTable[idx].DataCrc = 0u;
         Fee_BlockInfoTable[idx].SequenceCounter = 0u;
         Fee_BlockInfoTable[idx].SectorIndex = 0u;
-        Fee_BlockInfoTable[idx].Immediate = FALSE;
         Fee_BlockSequenceCounters[idx] = 0u;
     }
 
@@ -305,7 +281,8 @@ FUNC(void, FEE_CODE) Fee_StateMachine_Process(void)
             }
             else
             {
-                /* All sector headers read -- determine active sector */
+                /* All sector headers read -- determine active sector
+                   (highest sequence number among ACTIVE sectors) */
                 VAR(uint32, AUTOMATIC) highestSeqNum = 0u;
                 VAR(boolean, AUTOMATIC) foundActive = FALSE;
                 VAR(uint16, AUTOMATIC) sIdx;
@@ -338,12 +315,35 @@ FUNC(void, FEE_CODE) Fee_StateMachine_Process(void)
                     }
                 }
 
-                /* Set scan cursor to first record position in active sector */
-                Fee_ScanRecordCursor =
-                    Fee_SectorInfo[Fee_ActiveSectorIndex].BaseAddress +
-                    FEE_SECTOR_HEADER_SIZE;
+                /* Scan ALL non-defective sectors for valid block records.
+                   This handles recovery after interrupted GC where valid
+                   blocks may exist in FULL or older ACTIVE sectors. */
+                Fee_InitScanSectorCursor = 0u;
 
-                Fee_InternalState = FEE_STATE_INIT_SCAN_READ_RECORD;
+                /* Advance to first scannable sector */
+                while ((Fee_InitScanSectorCursor < Fee_ConfigPtr->NumberOfSectors) &&
+                       (Fee_SectorInfo[Fee_InitScanSectorCursor].Status == FEE_SECTOR_DEFECTIVE ||
+                        Fee_SectorInfo[Fee_InitScanSectorCursor].Status == FEE_SECTOR_ERASED))
+                {
+                    Fee_InitScanSectorCursor++;
+                }
+
+                if (Fee_InitScanSectorCursor < Fee_ConfigPtr->NumberOfSectors)
+                {
+                    Fee_ScanRecordCursor =
+                        Fee_SectorInfo[Fee_InitScanSectorCursor].BaseAddress +
+                        FEE_SECTOR_HEADER_SIZE;
+                    Fee_InternalState = FEE_STATE_INIT_SCAN_READ_RECORD;
+                }
+                else
+                {
+                    /* No scannable sectors -- init complete */
+                    Fee_ModuleStatus = MEMIF_IDLE;
+                    Fee_InternalState = FEE_STATE_IDLE;
+#if (FEE_SAFETY_ENABLE == STD_ON)
+                    Fee_Safety_UpdateRamCrc();
+#endif
+                }
             }
             break;
         }
@@ -353,19 +353,42 @@ FUNC(void, FEE_CODE) Fee_StateMachine_Process(void)
          *================================================================*/
         case FEE_STATE_INIT_SCAN_READ_RECORD:
         {
-            /* Check if we've reached the end of the active sector */
+            /* Check if we've reached the end of the current scan sector */
             VAR(MemAcc_AddressType, AUTOMATIC) sectorEnd;
-            sectorEnd = Fee_SectorInfo[Fee_ActiveSectorIndex].BaseAddress +
+            sectorEnd = Fee_SectorInfo[Fee_InitScanSectorCursor].BaseAddress +
                         Fee_ConfigPtr->SectorSize;
 
             if (Fee_ScanRecordCursor >= sectorEnd)
             {
-                /* Past end of sector -- scanning complete */
-                Fee_ModuleStatus = MEMIF_IDLE;
-                Fee_InternalState = FEE_STATE_IDLE;
+                /* Past end of current sector -- update its write pointer */
+                /* (leave write pointer at sector end) */
+
+                /* Advance to next scannable sector (ACTIVE or FULL) */
+                Fee_InitScanSectorCursor++;
+                while ((Fee_InitScanSectorCursor < Fee_ConfigPtr->NumberOfSectors) &&
+                       (Fee_SectorInfo[Fee_InitScanSectorCursor].Status == FEE_SECTOR_DEFECTIVE ||
+                        Fee_SectorInfo[Fee_InitScanSectorCursor].Status == FEE_SECTOR_ERASED))
+                {
+                    Fee_InitScanSectorCursor++;
+                }
+
+                if (Fee_InitScanSectorCursor < Fee_ConfigPtr->NumberOfSectors)
+                {
+                    /* Start scanning next sector */
+                    Fee_ScanRecordCursor =
+                        Fee_SectorInfo[Fee_InitScanSectorCursor].BaseAddress +
+                        FEE_SECTOR_HEADER_SIZE;
+                    /* Stay in FEE_STATE_INIT_SCAN_READ_RECORD */
+                }
+                else
+                {
+                    /* All sectors scanned -- init complete */
+                    Fee_ModuleStatus = MEMIF_IDLE;
+                    Fee_InternalState = FEE_STATE_IDLE;
 #if (FEE_SAFETY_ENABLE == STD_ON)
-                Fee_Safety_UpdateRamCrc();
+                    Fee_Safety_UpdateRamCrc();
 #endif
+                }
                 break;
             }
 
@@ -390,12 +413,29 @@ FUNC(void, FEE_CODE) Fee_StateMachine_Process(void)
 
             if (memAccResult != MEMACC_JOB_OK)
             {
-                /* Read failed -- stop scanning */
-                Fee_ModuleStatus = MEMIF_IDLE;
-                Fee_InternalState = FEE_STATE_IDLE;
+                /* Read failed -- advance to next sector */
+                Fee_InitScanSectorCursor++;
+                while ((Fee_InitScanSectorCursor < Fee_ConfigPtr->NumberOfSectors) &&
+                       (Fee_SectorInfo[Fee_InitScanSectorCursor].Status == FEE_SECTOR_DEFECTIVE ||
+                        Fee_SectorInfo[Fee_InitScanSectorCursor].Status == FEE_SECTOR_ERASED))
+                {
+                    Fee_InitScanSectorCursor++;
+                }
+                if (Fee_InitScanSectorCursor < Fee_ConfigPtr->NumberOfSectors)
+                {
+                    Fee_ScanRecordCursor =
+                        Fee_SectorInfo[Fee_InitScanSectorCursor].BaseAddress +
+                        FEE_SECTOR_HEADER_SIZE;
+                    Fee_InternalState = FEE_STATE_INIT_SCAN_READ_RECORD;
+                }
+                else
+                {
+                    Fee_ModuleStatus = MEMIF_IDLE;
+                    Fee_InternalState = FEE_STATE_IDLE;
 #if (FEE_SAFETY_ENABLE == STD_ON)
-                Fee_Safety_UpdateRamCrc();
+                    Fee_Safety_UpdateRamCrc();
 #endif
+                }
                 break;
             }
 
@@ -404,18 +444,39 @@ FUNC(void, FEE_CODE) Fee_StateMachine_Process(void)
             /* Check if header is blank (all 0x00 = erased area) */
             if (Fee_Internal_IsHeaderBlank(headerBuf) == TRUE)
             {
-                /* Reached blank area -- update write pointer and finish scan */
-                Fee_SectorInfo[Fee_ActiveSectorIndex].WritePointer =
+                /* Reached blank area -- update write pointer for this sector */
+                Fee_SectorInfo[Fee_InitScanSectorCursor].WritePointer =
                     Fee_ScanRecordCursor;
-                Fee_SectorInfo[Fee_ActiveSectorIndex].FreeSpace =
-                    (uint16)(Fee_SectorInfo[Fee_ActiveSectorIndex].BaseAddress +
+                Fee_SectorInfo[Fee_InitScanSectorCursor].FreeSpace =
+                    (uint16)(Fee_SectorInfo[Fee_InitScanSectorCursor].BaseAddress +
                              Fee_ConfigPtr->SectorSize -
                              Fee_ScanRecordCursor);
-                Fee_ModuleStatus = MEMIF_IDLE;
-                Fee_InternalState = FEE_STATE_IDLE;
+
+                /* Advance to next scannable sector */
+                Fee_InitScanSectorCursor++;
+                while ((Fee_InitScanSectorCursor < Fee_ConfigPtr->NumberOfSectors) &&
+                       (Fee_SectorInfo[Fee_InitScanSectorCursor].Status == FEE_SECTOR_DEFECTIVE ||
+                        Fee_SectorInfo[Fee_InitScanSectorCursor].Status == FEE_SECTOR_ERASED))
+                {
+                    Fee_InitScanSectorCursor++;
+                }
+
+                if (Fee_InitScanSectorCursor < Fee_ConfigPtr->NumberOfSectors)
+                {
+                    Fee_ScanRecordCursor =
+                        Fee_SectorInfo[Fee_InitScanSectorCursor].BaseAddress +
+                        FEE_SECTOR_HEADER_SIZE;
+                    Fee_InternalState = FEE_STATE_INIT_SCAN_READ_RECORD;
+                }
+                else
+                {
+                    /* All sectors scanned -- init complete */
+                    Fee_ModuleStatus = MEMIF_IDLE;
+                    Fee_InternalState = FEE_STATE_IDLE;
 #if (FEE_SAFETY_ENABLE == STD_ON)
-                Fee_Safety_UpdateRamCrc();
+                    Fee_Safety_UpdateRamCrc();
 #endif
+                }
                 break;
             }
 
@@ -427,7 +488,7 @@ FUNC(void, FEE_CODE) Fee_StateMachine_Process(void)
             if (parseResult == E_OK)
             {
                 /* Look up block index in config */
-                blkIdx = Fee_Internal_LookupBlockIndex(blockNum);
+                blkIdx = Fee_Internal_FindBlockIndex(blockNum);
 
                 if (blkIdx != FEE_BLOCK_INDEX_INVALID)
                 {
@@ -444,7 +505,7 @@ FUNC(void, FEE_CODE) Fee_StateMachine_Process(void)
                         Fee_BlockInfoTable[blkIdx].DataCrc = dataCrc;
                         Fee_BlockInfoTable[blkIdx].SequenceCounter = seqCounter;
                         Fee_BlockInfoTable[blkIdx].SectorIndex =
-                            Fee_ActiveSectorIndex;
+                            (uint8)Fee_InitScanSectorCursor;
 
                         if (validMarker == FEE_MARKER_VALID)
                         {
@@ -514,7 +575,7 @@ FUNC(void, FEE_CODE) Fee_StateMachine_Process(void)
          *================================================================*/
         case FEE_STATE_READ_START:
         {
-            blkIdx = Fee_Internal_LookupBlockIndex(Fee_CurrentJob.BlockNumber);
+            blkIdx = Fee_Internal_FindBlockIndex(Fee_CurrentJob.BlockNumber);
             Fee_CurrentBlockIndex = blkIdx;
 
             if (blkIdx == FEE_BLOCK_INDEX_INVALID)
@@ -611,7 +672,7 @@ FUNC(void, FEE_CODE) Fee_StateMachine_Process(void)
          *================================================================*/
         case FEE_STATE_WRITE_ALLOC:
         {
-            blkIdx = Fee_Internal_LookupBlockIndex(Fee_CurrentJob.BlockNumber);
+            blkIdx = Fee_Internal_FindBlockIndex(Fee_CurrentJob.BlockNumber);
             Fee_CurrentBlockIndex = blkIdx;
 
             if (blkIdx == FEE_BLOCK_INDEX_INVALID)
@@ -637,8 +698,19 @@ FUNC(void, FEE_CODE) Fee_StateMachine_Process(void)
 
                 if (Fee_WriteAllocAddress == 0u)
                 {
-                    /* Sector full -- trigger GC (stub: just fail for now) */
-                    Fee_StateMachine_CompleteJob(MEMIF_JOB_FAILED);
+                    /* Sector full -- trigger garbage collection to reclaim space */
+                    if (Fee_GarbageCollect_Trigger() == E_OK)
+                    {
+                        /* GC triggered: save pending write, transition to GC */
+                        Fee_WriteAfterGcPending = TRUE;
+                        Fee_ModuleStatus = MEMIF_BUSY_INTERNAL;
+                        Fee_InternalState = FEE_STATE_GC_ACTIVE;
+                    }
+                    else
+                    {
+                        /* No target sector available for GC -- fail the write */
+                        Fee_StateMachine_CompleteJob(MEMIF_JOB_FAILED);
+                    }
                     break;
                 }
 
@@ -751,21 +823,19 @@ FUNC(void, FEE_CODE) Fee_StateMachine_Process(void)
 
         case FEE_STATE_WRITE_VALID:
         {
-            /* Re-read header page, set byte 30 to 0x55 (valid), write full page */
+            /* Rebuild header from local data and set valid marker.
+               The header content is fully known from the write parameters;
+               no async read-before-modify-write is needed. */
+            blkIdx = Fee_CurrentBlockIndex;
             headerBuf = Fee_Sector_GetHeaderBuffer();
 
-            /* Read the header page back first */
-            (void)MemAcc_Read(
-                Fee_ConfigPtr->MemAccAreaId,
-                Fee_WriteAllocAddress,
+            Fee_Sector_BuildBlockHeader(
                 headerBuf,
-                FEE_BLOCK_HEADER_SIZE);
-
-            /* We need to wait for this read to complete before modifying.
-               But we already have the header in buffer from when we built it.
-               For TC3xx, re-reading is safer but for simplicity we just
-               modify the buffer we already have. */
-            /* Actually set the valid marker directly in the header buffer */
+                Fee_CurrentJob.BlockNumber,
+                Fee_ConfigPtr->BlockConfigTable[blkIdx].BlockSize,
+                Fee_WriteDataCrc,
+                Fee_BlockSequenceCounters[blkIdx],
+                0u);
             headerBuf[30] = FEE_MARKER_VALID;
 
             /* Write the full header page with valid marker set */
@@ -910,7 +980,7 @@ FUNC(void, FEE_CODE) Fee_StateMachine_Process(void)
          *================================================================*/
         case FEE_STATE_INVALIDATE_WRITE:
         {
-            blkIdx = Fee_Internal_LookupBlockIndex(Fee_CurrentJob.BlockNumber);
+            blkIdx = Fee_Internal_FindBlockIndex(Fee_CurrentJob.BlockNumber);
             Fee_CurrentBlockIndex = blkIdx;
 
             if (blkIdx == FEE_BLOCK_INDEX_INVALID)
@@ -926,20 +996,20 @@ FUNC(void, FEE_CODE) Fee_StateMachine_Process(void)
                 break;
             }
 
-            /* Read the header page, set ValidMarker to 0xFF, write back */
+            /* Rebuild the header locally from known data and set invalid marker.
+               This avoids an async read-before-write race; the header content
+               is already known from the block info table. */
             headerBuf = Fee_Sector_GetHeaderBuffer();
-
-            /* Read existing header */
-            (void)MemAcc_Read(
-                Fee_ConfigPtr->MemAccAreaId,
-                Fee_BlockInfoTable[blkIdx].HeaderAddress,
+            Fee_Sector_BuildBlockHeader(
                 headerBuf,
-                FEE_BLOCK_HEADER_SIZE);
-
-            /* Set invalid marker */
+                Fee_CurrentJob.BlockNumber,
+                Fee_BlockInfoTable[blkIdx].DataLength,
+                Fee_BlockInfoTable[blkIdx].DataCrc,
+                Fee_BlockInfoTable[blkIdx].SequenceCounter,
+                0u);
             headerBuf[30] = FEE_MARKER_INVALID;
 
-            /* Write back the modified header */
+            /* Write the header with invalid marker */
             (void)MemAcc_Write(
                 Fee_ConfigPtr->MemAccAreaId,
                 Fee_BlockInfoTable[blkIdx].HeaderAddress,
@@ -982,7 +1052,7 @@ FUNC(void, FEE_CODE) Fee_StateMachine_Process(void)
          *================================================================*/
         case FEE_STATE_ERASE_IMMEDIATE:
         {
-            blkIdx = Fee_Internal_LookupBlockIndex(Fee_CurrentJob.BlockNumber);
+            blkIdx = Fee_Internal_FindBlockIndex(Fee_CurrentJob.BlockNumber);
             Fee_CurrentBlockIndex = blkIdx;
 
             if (blkIdx == FEE_BLOCK_INDEX_INVALID)
@@ -996,13 +1066,16 @@ FUNC(void, FEE_CODE) Fee_StateMachine_Process(void)
             if ((Fee_BlockInfoTable[blkIdx].Status == FEE_BLOCK_VALID) ||
                 (Fee_BlockInfoTable[blkIdx].Status == FEE_BLOCK_INCONSISTENT))
             {
-                /* Invalidate the existing entry first */
+                /* Rebuild header from known data and set invalid marker.
+                   Avoids async read+write race -- header content is known. */
                 headerBuf = Fee_Sector_GetHeaderBuffer();
-                (void)MemAcc_Read(
-                    Fee_ConfigPtr->MemAccAreaId,
-                    Fee_BlockInfoTable[blkIdx].HeaderAddress,
+                Fee_Sector_BuildBlockHeader(
                     headerBuf,
-                    FEE_BLOCK_HEADER_SIZE);
+                    Fee_CurrentJob.BlockNumber,
+                    Fee_BlockInfoTable[blkIdx].DataLength,
+                    Fee_BlockInfoTable[blkIdx].DataCrc,
+                    Fee_BlockInfoTable[blkIdx].SequenceCounter,
+                    0u);
                 headerBuf[30] = FEE_MARKER_INVALID;
                 (void)MemAcc_Write(
                     Fee_ConfigPtr->MemAccAreaId,
@@ -1056,12 +1129,47 @@ FUNC(void, FEE_CODE) Fee_StateMachine_Process(void)
 
             if (gcResult == FEE_GC_COMPLETE)
             {
-                Fee_ModuleStatus = MEMIF_IDLE;
-                Fee_InternalState = FEE_STATE_IDLE;
+                if (Fee_WriteAfterGcPending == TRUE)
+                {
+                    /* GC completed -- retry the pending write.
+                       Update active sector index to the GC target. */
+                    VAR(uint16, AUTOMATIC) sIdx;
+                    VAR(uint32, AUTOMATIC) highSeq = 0u;
+                    VAR(boolean, AUTOMATIC) found = FALSE;
+
+                    for (sIdx = 0u; sIdx < Fee_ConfigPtr->NumberOfSectors; sIdx++)
+                    {
+                        if ((Fee_SectorInfo[sIdx].Status == FEE_SECTOR_ACTIVE) &&
+                            ((found == FALSE) ||
+                             (Fee_SectorInfo[sIdx].SequenceNumber > highSeq)))
+                        {
+                            highSeq = Fee_SectorInfo[sIdx].SequenceNumber;
+                            Fee_ActiveSectorIndex = (uint8)sIdx;
+                            found = TRUE;
+                        }
+                    }
+
+                    Fee_WriteAfterGcPending = FALSE;
+                    Fee_ModuleStatus = MEMIF_BUSY;
+                    Fee_InternalState = FEE_STATE_WRITE_ALLOC;
+                }
+                else
+                {
+                    Fee_ModuleStatus = MEMIF_IDLE;
+                    Fee_InternalState = FEE_STATE_IDLE;
+                }
             }
             else if (gcResult == FEE_GC_ERROR)
             {
-                Fee_InternalState = FEE_STATE_ERROR;
+                if (Fee_WriteAfterGcPending == TRUE)
+                {
+                    Fee_WriteAfterGcPending = FALSE;
+                    Fee_StateMachine_CompleteJob(MEMIF_JOB_FAILED);
+                }
+                else
+                {
+                    Fee_InternalState = FEE_STATE_ERROR;
+                }
             }
             /* else: FEE_GC_IN_PROGRESS -- stay in GC_ACTIVE */
             break;
@@ -1079,7 +1187,7 @@ FUNC(void, FEE_CODE) Fee_StateMachine_Process(void)
             break;
         }
 
-        /* Unused states (for future expansion) */
+        /* Reserved for future data-verification during init scan */
         case FEE_STATE_INIT_SCAN_READ_DATA:
         case FEE_STATE_INIT_SCAN_WAIT_DATA:
         case FEE_STATE_INIT_SCAN_NEXT_RECORD:
@@ -1129,7 +1237,7 @@ FUNC(Std_ReturnType, FEE_CODE) Fee_StateMachine_AcceptJob(
             Fee_CurrentJob.WriteDataPtr = Job->WriteDataPtr;
             Fee_CurrentJob.IsImmediate = Job->IsImmediate;
 
-            Fee_GcSuspended = TRUE;
+            Fee_SM_GcSuspended = TRUE;
             Fee_ModuleStatus = MEMIF_BUSY;
             Fee_LastJobResult = MEMIF_JOB_PENDING;
             Fee_InternalState = FEE_STATE_IDLE;
@@ -1160,10 +1268,10 @@ FUNC(void, FEE_CODE) Fee_StateMachine_CompleteJob(
     Fee_CurrentJob.IsImmediate = FALSE;
 
     /* Set module status */
-    if (Fee_GcSuspended == TRUE)
+    if (Fee_SM_GcSuspended == TRUE)
     {
         /* Resume GC */
-        Fee_GcSuspended = FALSE;
+        Fee_SM_GcSuspended = FALSE;
         Fee_ModuleStatus = MEMIF_BUSY_INTERNAL;
         Fee_InternalState = FEE_STATE_GC_ACTIVE;
     }

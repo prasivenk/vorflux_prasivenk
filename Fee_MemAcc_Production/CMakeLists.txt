@@ -19,6 +19,7 @@ project(Fee_MemAcc_Production C)
 
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_C_EXTENSIONS OFF)
 
 # Compiler flags — strict, plus unit-test macro
 add_compile_options(-Wall -Wextra -Werror -pedantic -DFEE_UNIT_TEST)
@@ -29,6 +30,7 @@ set(COMMON_INCLUDES
     ${CMAKE_SOURCE_DIR}/test/stubs
     ${CMAKE_SOURCE_DIR}/test/unity
     ${CMAKE_SOURCE_DIR}/test
+    ${CMAKE_SOURCE_DIR}/test/helpers
 )
 
 include_directories(${COMMON_INCLUDES})
@@ -67,6 +69,9 @@ add_library(unity OBJECT ${CMAKE_SOURCE_DIR}/test/unity/unity.c)
 file(GLOB STUB_SOURCES ${CMAKE_SOURCE_DIR}/test/stubs/*.c)
 add_library(stubs OBJECT ${STUB_SOURCES})
 
+# --- Shared test helpers ---
+add_library(test_helpers OBJECT ${CMAKE_SOURCE_DIR}/test/helpers/test_Fee_Helpers.c)
+
 ##############################################################################
 # Helper: add a test executable
 ##############################################################################
@@ -76,6 +81,7 @@ function(add_fee_test TEST_NAME TEST_SOURCE TEST_GROUP)
         fee_lib memacc_lib
         $<TARGET_OBJECTS:unity>
         $<TARGET_OBJECTS:stubs>
+        $<TARGET_OBJECTS:test_helpers>
     )
     add_test(NAME ${TEST_NAME} COMMAND ${TEST_NAME})
     set_tests_properties(${TEST_NAME} PROPERTIES LABELS "${TEST_GROUP}")

@@ -27,6 +27,7 @@
  *============================================================================*/
 
 #include "Fee_GarbageCollect.h"
+#include "Fee_Internal.h"
 #include "Fee_StateMachine.h"
 #include "Fee_Sector.h"
 #include "Fee_Crc.h"
@@ -51,18 +52,12 @@ typedef enum
     FEE_GC_COPY_WRITE_DATA_WAIT     = 7,
     FEE_GC_COPY_WRITE_VALID         = 8,
     FEE_GC_COPY_WRITE_VALID_WAIT    = 9,
-    FEE_GC_ERASE_SOURCE             = 10,
-    FEE_GC_ERASE_WAIT               = 11,
-    FEE_GC_COMPLETE_STATE           = 12
+    FEE_GC_WRITE_TARGET_HEADER       = 10,
+    FEE_GC_WRITE_TARGET_HEADER_WAIT  = 11,
+    FEE_GC_ERASE_SOURCE             = 12,
+    FEE_GC_ERASE_WAIT               = 13,
+    FEE_GC_COMPLETE_STATE           = 14
 } Fee_GcInternalStateType;
-
-/*============================================================================*
- *  Alignment macro
- *============================================================================*/
-
-/** \brief Align value up to the next multiple of alignment */
-#define FEE_GC_ALIGN_UP(value, alignment)  \
-    (((uint32)(value) + ((uint32)(alignment) - 1u)) & ~((uint32)(alignment) - 1u))
 
 /*============================================================================*
  *  Module state variables
@@ -80,8 +75,8 @@ static VAR(uint8, FEE_VAR) Fee_GcTargetSector;
 /** \brief Current block index being processed in BlockInfoTable */
 static VAR(uint16, FEE_VAR) Fee_GcCurrentBlock;
 
-/** \brief Suspended flag for immediate job preemption */
-static VAR(boolean, FEE_VAR) Fee_GcSuspended;
+/** \brief Suspended flag for immediate job preemption (GC internal) */
+static VAR(boolean, FEE_VAR) Fee_GcInternal_Suspended;
 
 /** \brief Header address allocated for current block copy in target sector */
 static VAR(MemAcc_AddressType, FEE_VAR) Fee_GcAllocAddress;
@@ -110,7 +105,7 @@ FUNC(void, FEE_CODE) Fee_GarbageCollect_Init(void)
     Fee_GcSourceSector = 0u;
     Fee_GcTargetSector = 0u;
     Fee_GcCurrentBlock = 0u;
-    Fee_GcSuspended    = FALSE;
+    Fee_GcInternal_Suspended    = FALSE;
     Fee_GcAllocAddress = 0u;
 }
 
@@ -181,7 +176,7 @@ FUNC(Std_ReturnType, FEE_CODE) Fee_GarbageCollect_Trigger(void)
     Fee_GcSourceSector = bestSource;
     Fee_GcTargetSector = bestTarget;
     Fee_GcCurrentBlock = 0u;
-    Fee_GcSuspended    = FALSE;
+    Fee_GcInternal_Suspended    = FALSE;
     Fee_GcState        = FEE_GC_SELECT_SOURCE;
 
     return E_OK;
@@ -207,7 +202,7 @@ FUNC(Fee_GcResultType, FEE_CODE) Fee_GarbageCollect_Process(void)
     }
 
     /* If suspended, return in-progress without advancing */
-    if (Fee_GcSuspended == TRUE)
+    if (Fee_GcInternal_Suspended == TRUE)
     {
         return FEE_GC_IN_PROGRESS;
     }
@@ -240,8 +235,9 @@ FUNC(Fee_GcResultType, FEE_CODE) Fee_GarbageCollect_Process(void)
             }
             else
             {
-                /* No more valid blocks in source -- erase it */
-                Fee_GcState = FEE_GC_ERASE_SOURCE;
+                /* No more valid blocks in source -- write target sector header
+                   before erasing source (ensures target is discoverable after reset) */
+                Fee_GcState = FEE_GC_WRITE_TARGET_HEADER;
             }
             return FEE_GC_IN_PROGRESS;
         }
@@ -522,6 +518,71 @@ FUNC(Fee_GcResultType, FEE_CODE) Fee_GarbageCollect_Process(void)
         }
 
         /*================================================================*
+         *  WRITE_TARGET_HEADER: commit target sector header before erase
+         *  This ensures the target sector is discoverable after a reset.
+         *================================================================*/
+        case FEE_GC_WRITE_TARGET_HEADER:
+        {
+            VAR(uint32, AUTOMATIC) newSeqNum;
+            headerBuf = Fee_Sector_GetHeaderBuffer();
+
+            /* Target sector gets sequence number higher than source */
+            newSeqNum = Fee_SectorInfo[Fee_GcSourceSector].SequenceNumber + 1u;
+
+            Fee_Sector_BuildSectorHeader(
+                headerBuf,
+                newSeqNum,
+                Fee_SectorInfo[Fee_GcTargetSector].EraseCount);
+
+            ret = MemAcc_Write(
+                Fee_ConfigPtr->MemAccAreaId,
+                Fee_SectorInfo[Fee_GcTargetSector].BaseAddress,
+                headerBuf,
+                (MemAcc_LengthType)FEE_SECTOR_HEADER_SIZE);
+
+            if (ret != E_OK)
+            {
+                (void)Dem_SetEventStatus(FEE_E_HARDWARE_ERROR,
+                                         DEM_EVENT_STATUS_FAILED);
+                Fee_GcState = FEE_GC_IDLE;
+                return FEE_GC_ERROR;
+            }
+
+            Fee_GcState = FEE_GC_WRITE_TARGET_HEADER_WAIT;
+            return FEE_GC_IN_PROGRESS;
+        }
+
+        /*================================================================*
+         *  WRITE_TARGET_HEADER_WAIT: poll MemAcc for header write
+         *================================================================*/
+        case FEE_GC_WRITE_TARGET_HEADER_WAIT:
+        {
+            VAR(uint32, AUTOMATIC) newSeqNum;
+            jobResult = MemAcc_GetJobResult(Fee_ConfigPtr->MemAccAreaId);
+
+            if (jobResult == MEMACC_JOB_PENDING)
+            {
+                return FEE_GC_IN_PROGRESS;
+            }
+
+            if (jobResult != MEMACC_JOB_OK)
+            {
+                (void)Dem_SetEventStatus(FEE_E_HARDWARE_ERROR,
+                                         DEM_EVENT_STATUS_FAILED);
+                Fee_GcState = FEE_GC_IDLE;
+                return FEE_GC_ERROR;
+            }
+
+            /* Update target sector status to ACTIVE */
+            newSeqNum = Fee_SectorInfo[Fee_GcSourceSector].SequenceNumber + 1u;
+            Fee_SectorInfo[Fee_GcTargetSector].Status = FEE_SECTOR_ACTIVE;
+            Fee_SectorInfo[Fee_GcTargetSector].SequenceNumber = newSeqNum;
+
+            Fee_GcState = FEE_GC_ERASE_SOURCE;
+            return FEE_GC_IN_PROGRESS;
+        }
+
+        /*================================================================*
          *  ERASE_SOURCE: erase the source sector
          *================================================================*/
         case FEE_GC_ERASE_SOURCE:
@@ -621,7 +682,7 @@ FUNC(Fee_GcResultType, FEE_CODE) Fee_GarbageCollect_Process(void)
 
 FUNC(void, FEE_CODE) Fee_GarbageCollect_Suspend(void)
 {
-    Fee_GcSuspended = TRUE;
+    Fee_GcInternal_Suspended = TRUE;
 }
 
 /*============================================================================*
@@ -630,7 +691,7 @@ FUNC(void, FEE_CODE) Fee_GarbageCollect_Suspend(void)
 
 FUNC(void, FEE_CODE) Fee_GarbageCollect_Resume(void)
 {
-    Fee_GcSuspended = FALSE;
+    Fee_GcInternal_Suspended = FALSE;
 }
 
 /*============================================================================*

@@ -17,6 +17,7 @@
  *============================================================================*/
 
 #include "MemAcc.h"
+#include "MemAcc_Internal.h"
 #include "MemAcc_Cfg.h"
 #include "Det.h"
 #include "Dem.h"
@@ -56,6 +57,137 @@ P2CONST(MemAcc_ConfigType, AUTOMATIC, MEMACC_CONST) MemAcc_ConfigPtr = NULL_PTR;
 
 #define MEMACC_START_SEC_CODE
 #include "MemAcc_MemMap.h"
+
+/*============================================================================*
+ *  Internal helpers
+ *============================================================================*/
+
+/**
+ * \brief  Finish a job by setting result and clearing busy state
+ */
+FUNC(void, MEMACC_CODE) MemAcc_Internal_FinishJob(
+    uint8 AreaIndex,
+    MemAcc_JobResultType Result
+)
+{
+    SchM_Enter_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
+    MemAcc_AreaJobResult[AreaIndex] = Result;
+    MemAcc_AreaBusy[AreaIndex] = FALSE;
+    MemAcc_CurrentJob[AreaIndex].JobType = MEMACC_JOB_NONE;
+    SchM_Exit_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
+}
+
+/**
+ * \brief  Common job acceptance: DET checks, busy/lock, job setup, dispatch
+ */
+FUNC(Std_ReturnType, MEMACC_CODE) MemAcc_Internal_AcceptJob(
+    MemAcc_AddressAreaIdType AreaId,
+    MemAcc_JobType JobType,
+    MemAcc_AddressType Address,
+    P2VAR(MemAcc_DataType, AUTOMATIC, MEMACC_APPL_DATA) ReadPtr,
+    P2CONST(MemAcc_DataType, AUTOMATIC, MEMACC_APPL_DATA) WritePtr,
+    P2CONST(MemAcc_DataType, AUTOMATIC, MEMACC_APPL_DATA) ComparePtr,
+    MemAcc_LengthType Length,
+    uint8 ServiceId
+)
+{
+    Std_ReturnType retVal = E_NOT_OK;
+    uint8 areaIndex;
+
+#if (MEMACC_DEV_ERROR_DETECT == STD_ON)
+    if (MemAcc_ModuleStatus == MEMACC_UNINIT)
+    {
+        (void)Det_ReportError(MEMACC_MODULE_ID, MEMACC_INSTANCE_ID,
+                              ServiceId, MEMACC_E_UNINIT);
+        return E_NOT_OK;
+    }
+    if (MemAcc_Internal_FindArea(AreaId, &areaIndex) == FALSE)
+    {
+        (void)Det_ReportError(MEMACC_MODULE_ID, MEMACC_INSTANCE_ID,
+                              ServiceId, MEMACC_E_PARAM_ADDRESS_AREA);
+        return E_NOT_OK;
+    }
+    /* Pointer check: Read needs ReadPtr, Write needs WritePtr, Compare needs ComparePtr */
+    if (((JobType == MEMACC_JOB_READ) && (ReadPtr == NULL_PTR)) ||
+        ((JobType == MEMACC_JOB_WRITE) && (WritePtr == NULL_PTR)) ||
+        ((JobType == MEMACC_JOB_COMPARE) && (ComparePtr == NULL_PTR)))
+    {
+        (void)Det_ReportError(MEMACC_MODULE_ID, MEMACC_INSTANCE_ID,
+                              ServiceId, MEMACC_E_PARAM_POINTER);
+        return E_NOT_OK;
+    }
+    if (Length == 0u)
+    {
+        (void)Det_ReportError(MEMACC_MODULE_ID, MEMACC_INSTANCE_ID,
+                              ServiceId, MEMACC_E_PARAM_LENGTH);
+        return E_NOT_OK;
+    }
+    if (MemAcc_Internal_ValidateAddress(AreaId, Address, Length) == FALSE)
+    {
+        (void)Det_ReportError(MEMACC_MODULE_ID, MEMACC_INSTANCE_ID,
+                              ServiceId, MEMACC_E_PARAM_ADDRESS);
+        return E_NOT_OK;
+    }
+#else
+    if (MemAcc_Internal_FindArea(AreaId, &areaIndex) == FALSE)
+    {
+        return E_NOT_OK;
+    }
+    (void)ServiceId;
+#endif
+
+    SchM_Enter_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
+
+    if (MemAcc_AreaBusy[areaIndex] == TRUE)
+    {
+#if (MEMACC_DEV_ERROR_DETECT == STD_ON)
+        (void)Det_ReportError(MEMACC_MODULE_ID, MEMACC_INSTANCE_ID,
+                              ServiceId, MEMACC_E_BUSY);
+#endif
+        SchM_Exit_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
+        return E_NOT_OK;
+    }
+
+    if (MemAcc_AreaLocked[areaIndex] == TRUE)
+    {
+        SchM_Exit_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
+        return E_NOT_OK;
+    }
+
+    MemAcc_CurrentJob[areaIndex].JobType = JobType;
+    MemAcc_CurrentJob[areaIndex].AreaId = AreaId;
+    MemAcc_CurrentJob[areaIndex].Address = Address;
+    MemAcc_CurrentJob[areaIndex].ReadDataPtr = ReadPtr;
+    MemAcc_CurrentJob[areaIndex].WriteDataPtr = WritePtr;
+    MemAcc_CurrentJob[areaIndex].CompareDataPtr = ComparePtr;
+    MemAcc_CurrentJob[areaIndex].Length = Length;
+    MemAcc_CurrentJob[areaIndex].ProcessedLength = 0u;
+
+    MemAcc_AreaJobResult[areaIndex] = MEMACC_JOB_PENDING;
+    MemAcc_AreaBusy[areaIndex] = TRUE;
+
+    SchM_Exit_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
+
+    /* Compare is handled in MainFunction, not dispatched to driver */
+    if (JobType == MEMACC_JOB_COMPARE)
+    {
+        retVal = E_OK;
+    }
+    else
+    {
+        retVal = MemAcc_Internal_DispatchToMemDriver(areaIndex);
+        if (retVal != E_OK)
+        {
+            MemAcc_Internal_FinishJob(areaIndex, MEMACC_JOB_FAILED);
+        }
+    }
+
+    return retVal;
+}
+
+/*============================================================================*
+ *  Public API implementations
+ *============================================================================*/
 
 /**
  * \brief  Initialize the MemAcc module
@@ -142,83 +274,10 @@ FUNC(Std_ReturnType, MEMACC_CODE) MemAcc_Read(
     MemAcc_LengthType Length
 )
 {
-    Std_ReturnType retVal = E_NOT_OK;
-
-#if (MEMACC_DEV_ERROR_DETECT == STD_ON)
-    if (MemAcc_ModuleStatus == MEMACC_UNINIT)
-    {
-        (void)Det_ReportError(MEMACC_MODULE_ID, MEMACC_INSTANCE_ID,
-                              MEMACC_SID_READ, MEMACC_E_UNINIT);
-        return E_NOT_OK;
-    }
-    if (MemAcc_Internal_FindArea(AreaId) == FALSE)
-    {
-        (void)Det_ReportError(MEMACC_MODULE_ID, MEMACC_INSTANCE_ID,
-                              MEMACC_SID_READ, MEMACC_E_PARAM_ADDRESS_AREA);
-        return E_NOT_OK;
-    }
-    if (DataPtr == NULL_PTR)
-    {
-        (void)Det_ReportError(MEMACC_MODULE_ID, MEMACC_INSTANCE_ID,
-                              MEMACC_SID_READ, MEMACC_E_PARAM_POINTER);
-        return E_NOT_OK;
-    }
-    if (Length == 0u)
-    {
-        (void)Det_ReportError(MEMACC_MODULE_ID, MEMACC_INSTANCE_ID,
-                              MEMACC_SID_READ, MEMACC_E_PARAM_LENGTH);
-        return E_NOT_OK;
-    }
-    if (MemAcc_Internal_ValidateAddress(AreaId, Address, Length) == FALSE)
-    {
-        (void)Det_ReportError(MEMACC_MODULE_ID, MEMACC_INSTANCE_ID,
-                              MEMACC_SID_READ, MEMACC_E_PARAM_ADDRESS);
-        return E_NOT_OK;
-    }
-#endif
-
-    SchM_Enter_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
-
-    if (MemAcc_AreaBusy[AreaId] == TRUE)
-    {
-#if (MEMACC_DEV_ERROR_DETECT == STD_ON)
-        (void)Det_ReportError(MEMACC_MODULE_ID, MEMACC_INSTANCE_ID,
-                              MEMACC_SID_READ, MEMACC_E_BUSY);
-#endif
-        SchM_Exit_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
-        return E_NOT_OK;
-    }
-
-    if (MemAcc_AreaLocked[AreaId] == TRUE)
-    {
-        SchM_Exit_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
-        return E_NOT_OK;
-    }
-
-    MemAcc_CurrentJob[AreaId].JobType = MEMACC_JOB_READ;
-    MemAcc_CurrentJob[AreaId].AreaId = AreaId;
-    MemAcc_CurrentJob[AreaId].Address = Address;
-    MemAcc_CurrentJob[AreaId].ReadDataPtr = DataPtr;
-    MemAcc_CurrentJob[AreaId].WriteDataPtr = NULL_PTR;
-    MemAcc_CurrentJob[AreaId].CompareDataPtr = NULL_PTR;
-    MemAcc_CurrentJob[AreaId].Length = Length;
-    MemAcc_CurrentJob[AreaId].ProcessedLength = 0u;
-
-    MemAcc_AreaJobResult[AreaId] = MEMACC_JOB_PENDING;
-    MemAcc_AreaBusy[AreaId] = TRUE;
-
-    SchM_Exit_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
-
-    retVal = MemAcc_Internal_DispatchToMemDriver(AreaId);
-    if (retVal != E_OK)
-    {
-        SchM_Enter_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
-        MemAcc_AreaBusy[AreaId] = FALSE;
-        MemAcc_AreaJobResult[AreaId] = MEMACC_JOB_FAILED;
-        SchM_Exit_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
-    }
-
-    return retVal;
+    return MemAcc_Internal_AcceptJob(
+        AreaId, MEMACC_JOB_READ, Address,
+        DataPtr, NULL_PTR, NULL_PTR,
+        Length, MEMACC_SID_READ);
 }
 
 /**
@@ -231,83 +290,10 @@ FUNC(Std_ReturnType, MEMACC_CODE) MemAcc_Write(
     MemAcc_LengthType Length
 )
 {
-    Std_ReturnType retVal = E_NOT_OK;
-
-#if (MEMACC_DEV_ERROR_DETECT == STD_ON)
-    if (MemAcc_ModuleStatus == MEMACC_UNINIT)
-    {
-        (void)Det_ReportError(MEMACC_MODULE_ID, MEMACC_INSTANCE_ID,
-                              MEMACC_SID_WRITE, MEMACC_E_UNINIT);
-        return E_NOT_OK;
-    }
-    if (MemAcc_Internal_FindArea(AreaId) == FALSE)
-    {
-        (void)Det_ReportError(MEMACC_MODULE_ID, MEMACC_INSTANCE_ID,
-                              MEMACC_SID_WRITE, MEMACC_E_PARAM_ADDRESS_AREA);
-        return E_NOT_OK;
-    }
-    if (DataPtr == NULL_PTR)
-    {
-        (void)Det_ReportError(MEMACC_MODULE_ID, MEMACC_INSTANCE_ID,
-                              MEMACC_SID_WRITE, MEMACC_E_PARAM_POINTER);
-        return E_NOT_OK;
-    }
-    if (Length == 0u)
-    {
-        (void)Det_ReportError(MEMACC_MODULE_ID, MEMACC_INSTANCE_ID,
-                              MEMACC_SID_WRITE, MEMACC_E_PARAM_LENGTH);
-        return E_NOT_OK;
-    }
-    if (MemAcc_Internal_ValidateAddress(AreaId, Address, Length) == FALSE)
-    {
-        (void)Det_ReportError(MEMACC_MODULE_ID, MEMACC_INSTANCE_ID,
-                              MEMACC_SID_WRITE, MEMACC_E_PARAM_ADDRESS);
-        return E_NOT_OK;
-    }
-#endif
-
-    SchM_Enter_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
-
-    if (MemAcc_AreaBusy[AreaId] == TRUE)
-    {
-#if (MEMACC_DEV_ERROR_DETECT == STD_ON)
-        (void)Det_ReportError(MEMACC_MODULE_ID, MEMACC_INSTANCE_ID,
-                              MEMACC_SID_WRITE, MEMACC_E_BUSY);
-#endif
-        SchM_Exit_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
-        return E_NOT_OK;
-    }
-
-    if (MemAcc_AreaLocked[AreaId] == TRUE)
-    {
-        SchM_Exit_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
-        return E_NOT_OK;
-    }
-
-    MemAcc_CurrentJob[AreaId].JobType = MEMACC_JOB_WRITE;
-    MemAcc_CurrentJob[AreaId].AreaId = AreaId;
-    MemAcc_CurrentJob[AreaId].Address = Address;
-    MemAcc_CurrentJob[AreaId].ReadDataPtr = NULL_PTR;
-    MemAcc_CurrentJob[AreaId].WriteDataPtr = DataPtr;
-    MemAcc_CurrentJob[AreaId].CompareDataPtr = NULL_PTR;
-    MemAcc_CurrentJob[AreaId].Length = Length;
-    MemAcc_CurrentJob[AreaId].ProcessedLength = 0u;
-
-    MemAcc_AreaJobResult[AreaId] = MEMACC_JOB_PENDING;
-    MemAcc_AreaBusy[AreaId] = TRUE;
-
-    SchM_Exit_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
-
-    retVal = MemAcc_Internal_DispatchToMemDriver(AreaId);
-    if (retVal != E_OK)
-    {
-        SchM_Enter_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
-        MemAcc_AreaBusy[AreaId] = FALSE;
-        MemAcc_AreaJobResult[AreaId] = MEMACC_JOB_FAILED;
-        SchM_Exit_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
-    }
-
-    return retVal;
+    return MemAcc_Internal_AcceptJob(
+        AreaId, MEMACC_JOB_WRITE, Address,
+        NULL_PTR, DataPtr, NULL_PTR,
+        Length, MEMACC_SID_WRITE);
 }
 
 /**
@@ -319,77 +305,10 @@ FUNC(Std_ReturnType, MEMACC_CODE) MemAcc_Erase(
     MemAcc_LengthType Length
 )
 {
-    Std_ReturnType retVal = E_NOT_OK;
-
-#if (MEMACC_DEV_ERROR_DETECT == STD_ON)
-    if (MemAcc_ModuleStatus == MEMACC_UNINIT)
-    {
-        (void)Det_ReportError(MEMACC_MODULE_ID, MEMACC_INSTANCE_ID,
-                              MEMACC_SID_ERASE, MEMACC_E_UNINIT);
-        return E_NOT_OK;
-    }
-    if (MemAcc_Internal_FindArea(AreaId) == FALSE)
-    {
-        (void)Det_ReportError(MEMACC_MODULE_ID, MEMACC_INSTANCE_ID,
-                              MEMACC_SID_ERASE, MEMACC_E_PARAM_ADDRESS_AREA);
-        return E_NOT_OK;
-    }
-    if (Length == 0u)
-    {
-        (void)Det_ReportError(MEMACC_MODULE_ID, MEMACC_INSTANCE_ID,
-                              MEMACC_SID_ERASE, MEMACC_E_PARAM_LENGTH);
-        return E_NOT_OK;
-    }
-    if (MemAcc_Internal_ValidateAddress(AreaId, Address, Length) == FALSE)
-    {
-        (void)Det_ReportError(MEMACC_MODULE_ID, MEMACC_INSTANCE_ID,
-                              MEMACC_SID_ERASE, MEMACC_E_PARAM_ADDRESS);
-        return E_NOT_OK;
-    }
-#endif
-
-    SchM_Enter_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
-
-    if (MemAcc_AreaBusy[AreaId] == TRUE)
-    {
-#if (MEMACC_DEV_ERROR_DETECT == STD_ON)
-        (void)Det_ReportError(MEMACC_MODULE_ID, MEMACC_INSTANCE_ID,
-                              MEMACC_SID_ERASE, MEMACC_E_BUSY);
-#endif
-        SchM_Exit_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
-        return E_NOT_OK;
-    }
-
-    if (MemAcc_AreaLocked[AreaId] == TRUE)
-    {
-        SchM_Exit_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
-        return E_NOT_OK;
-    }
-
-    MemAcc_CurrentJob[AreaId].JobType = MEMACC_JOB_ERASE;
-    MemAcc_CurrentJob[AreaId].AreaId = AreaId;
-    MemAcc_CurrentJob[AreaId].Address = Address;
-    MemAcc_CurrentJob[AreaId].ReadDataPtr = NULL_PTR;
-    MemAcc_CurrentJob[AreaId].WriteDataPtr = NULL_PTR;
-    MemAcc_CurrentJob[AreaId].CompareDataPtr = NULL_PTR;
-    MemAcc_CurrentJob[AreaId].Length = Length;
-    MemAcc_CurrentJob[AreaId].ProcessedLength = 0u;
-
-    MemAcc_AreaJobResult[AreaId] = MEMACC_JOB_PENDING;
-    MemAcc_AreaBusy[AreaId] = TRUE;
-
-    SchM_Exit_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
-
-    retVal = MemAcc_Internal_DispatchToMemDriver(AreaId);
-    if (retVal != E_OK)
-    {
-        SchM_Enter_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
-        MemAcc_AreaBusy[AreaId] = FALSE;
-        MemAcc_AreaJobResult[AreaId] = MEMACC_JOB_FAILED;
-        SchM_Exit_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
-    }
-
-    return retVal;
+    return MemAcc_Internal_AcceptJob(
+        AreaId, MEMACC_JOB_ERASE, Address,
+        NULL_PTR, NULL_PTR, NULL_PTR,
+        Length, MEMACC_SID_ERASE);
 }
 
 /**
@@ -401,77 +320,10 @@ FUNC(Std_ReturnType, MEMACC_CODE) MemAcc_BlankCheck(
     MemAcc_LengthType Length
 )
 {
-    Std_ReturnType retVal = E_NOT_OK;
-
-#if (MEMACC_DEV_ERROR_DETECT == STD_ON)
-    if (MemAcc_ModuleStatus == MEMACC_UNINIT)
-    {
-        (void)Det_ReportError(MEMACC_MODULE_ID, MEMACC_INSTANCE_ID,
-                              MEMACC_SID_BLANK_CHECK, MEMACC_E_UNINIT);
-        return E_NOT_OK;
-    }
-    if (MemAcc_Internal_FindArea(AreaId) == FALSE)
-    {
-        (void)Det_ReportError(MEMACC_MODULE_ID, MEMACC_INSTANCE_ID,
-                              MEMACC_SID_BLANK_CHECK, MEMACC_E_PARAM_ADDRESS_AREA);
-        return E_NOT_OK;
-    }
-    if (Length == 0u)
-    {
-        (void)Det_ReportError(MEMACC_MODULE_ID, MEMACC_INSTANCE_ID,
-                              MEMACC_SID_BLANK_CHECK, MEMACC_E_PARAM_LENGTH);
-        return E_NOT_OK;
-    }
-    if (MemAcc_Internal_ValidateAddress(AreaId, Address, Length) == FALSE)
-    {
-        (void)Det_ReportError(MEMACC_MODULE_ID, MEMACC_INSTANCE_ID,
-                              MEMACC_SID_BLANK_CHECK, MEMACC_E_PARAM_ADDRESS);
-        return E_NOT_OK;
-    }
-#endif
-
-    SchM_Enter_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
-
-    if (MemAcc_AreaBusy[AreaId] == TRUE)
-    {
-#if (MEMACC_DEV_ERROR_DETECT == STD_ON)
-        (void)Det_ReportError(MEMACC_MODULE_ID, MEMACC_INSTANCE_ID,
-                              MEMACC_SID_BLANK_CHECK, MEMACC_E_BUSY);
-#endif
-        SchM_Exit_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
-        return E_NOT_OK;
-    }
-
-    if (MemAcc_AreaLocked[AreaId] == TRUE)
-    {
-        SchM_Exit_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
-        return E_NOT_OK;
-    }
-
-    MemAcc_CurrentJob[AreaId].JobType = MEMACC_JOB_BLANKCHECK;
-    MemAcc_CurrentJob[AreaId].AreaId = AreaId;
-    MemAcc_CurrentJob[AreaId].Address = Address;
-    MemAcc_CurrentJob[AreaId].ReadDataPtr = NULL_PTR;
-    MemAcc_CurrentJob[AreaId].WriteDataPtr = NULL_PTR;
-    MemAcc_CurrentJob[AreaId].CompareDataPtr = NULL_PTR;
-    MemAcc_CurrentJob[AreaId].Length = Length;
-    MemAcc_CurrentJob[AreaId].ProcessedLength = 0u;
-
-    MemAcc_AreaJobResult[AreaId] = MEMACC_JOB_PENDING;
-    MemAcc_AreaBusy[AreaId] = TRUE;
-
-    SchM_Exit_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
-
-    retVal = MemAcc_Internal_DispatchToMemDriver(AreaId);
-    if (retVal != E_OK)
-    {
-        SchM_Enter_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
-        MemAcc_AreaBusy[AreaId] = FALSE;
-        MemAcc_AreaJobResult[AreaId] = MEMACC_JOB_FAILED;
-        SchM_Exit_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
-    }
-
-    return retVal;
+    return MemAcc_Internal_AcceptJob(
+        AreaId, MEMACC_JOB_BLANKCHECK, Address,
+        NULL_PTR, NULL_PTR, NULL_PTR,
+        Length, MEMACC_SID_BLANK_CHECK);
 }
 
 /**
@@ -484,77 +336,10 @@ FUNC(Std_ReturnType, MEMACC_CODE) MemAcc_Compare(
     MemAcc_LengthType Length
 )
 {
-    Std_ReturnType retVal = E_NOT_OK;
-
-#if (MEMACC_DEV_ERROR_DETECT == STD_ON)
-    if (MemAcc_ModuleStatus == MEMACC_UNINIT)
-    {
-        (void)Det_ReportError(MEMACC_MODULE_ID, MEMACC_INSTANCE_ID,
-                              MEMACC_SID_COMPARE, MEMACC_E_UNINIT);
-        return E_NOT_OK;
-    }
-    if (MemAcc_Internal_FindArea(AreaId) == FALSE)
-    {
-        (void)Det_ReportError(MEMACC_MODULE_ID, MEMACC_INSTANCE_ID,
-                              MEMACC_SID_COMPARE, MEMACC_E_PARAM_ADDRESS_AREA);
-        return E_NOT_OK;
-    }
-    if (DataPtr == NULL_PTR)
-    {
-        (void)Det_ReportError(MEMACC_MODULE_ID, MEMACC_INSTANCE_ID,
-                              MEMACC_SID_COMPARE, MEMACC_E_PARAM_POINTER);
-        return E_NOT_OK;
-    }
-    if (Length == 0u)
-    {
-        (void)Det_ReportError(MEMACC_MODULE_ID, MEMACC_INSTANCE_ID,
-                              MEMACC_SID_COMPARE, MEMACC_E_PARAM_LENGTH);
-        return E_NOT_OK;
-    }
-    if (MemAcc_Internal_ValidateAddress(AreaId, Address, Length) == FALSE)
-    {
-        (void)Det_ReportError(MEMACC_MODULE_ID, MEMACC_INSTANCE_ID,
-                              MEMACC_SID_COMPARE, MEMACC_E_PARAM_ADDRESS);
-        return E_NOT_OK;
-    }
-#endif
-
-    SchM_Enter_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
-
-    if (MemAcc_AreaBusy[AreaId] == TRUE)
-    {
-#if (MEMACC_DEV_ERROR_DETECT == STD_ON)
-        (void)Det_ReportError(MEMACC_MODULE_ID, MEMACC_INSTANCE_ID,
-                              MEMACC_SID_COMPARE, MEMACC_E_BUSY);
-#endif
-        SchM_Exit_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
-        return E_NOT_OK;
-    }
-
-    if (MemAcc_AreaLocked[AreaId] == TRUE)
-    {
-        SchM_Exit_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
-        return E_NOT_OK;
-    }
-
-    MemAcc_CurrentJob[AreaId].JobType = MEMACC_JOB_COMPARE;
-    MemAcc_CurrentJob[AreaId].AreaId = AreaId;
-    MemAcc_CurrentJob[AreaId].Address = Address;
-    MemAcc_CurrentJob[AreaId].ReadDataPtr = NULL_PTR;
-    MemAcc_CurrentJob[AreaId].WriteDataPtr = NULL_PTR;
-    MemAcc_CurrentJob[AreaId].CompareDataPtr = DataPtr;
-    MemAcc_CurrentJob[AreaId].Length = Length;
-    MemAcc_CurrentJob[AreaId].ProcessedLength = 0u;
-
-    MemAcc_AreaJobResult[AreaId] = MEMACC_JOB_PENDING;
-    MemAcc_AreaBusy[AreaId] = TRUE;
-
-    SchM_Exit_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
-
-    /* Compare is handled in MainFunction, just accept the job */
-    retVal = E_OK;
-
-    return retVal;
+    return MemAcc_Internal_AcceptJob(
+        AreaId, MEMACC_JOB_COMPARE, Address,
+        NULL_PTR, NULL_PTR, DataPtr,
+        Length, MEMACC_SID_COMPARE);
 }
 
 /**
@@ -565,6 +350,7 @@ FUNC(MemAcc_LengthType, MEMACC_CODE) MemAcc_GetProcessedLength(
 )
 {
     MemAcc_LengthType processedLen = 0u;
+    uint8 areaIndex;
 
 #if (MEMACC_DEV_ERROR_DETECT == STD_ON)
     if (MemAcc_ModuleStatus == MEMACC_UNINIT)
@@ -573,16 +359,21 @@ FUNC(MemAcc_LengthType, MEMACC_CODE) MemAcc_GetProcessedLength(
                               MEMACC_SID_GET_PROCESSED_LENGTH, MEMACC_E_UNINIT);
         return 0u;
     }
-    if (MemAcc_Internal_FindArea(AreaId) == FALSE)
+    if (MemAcc_Internal_FindArea(AreaId, &areaIndex) == FALSE)
     {
         (void)Det_ReportError(MEMACC_MODULE_ID, MEMACC_INSTANCE_ID,
                               MEMACC_SID_GET_PROCESSED_LENGTH, MEMACC_E_PARAM_ADDRESS_AREA);
         return 0u;
     }
+#else
+    if (MemAcc_Internal_FindArea(AreaId, &areaIndex) == FALSE)
+    {
+        return 0u;
+    }
 #endif
 
     SchM_Enter_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
-    processedLen = MemAcc_CurrentJob[AreaId].ProcessedLength;
+    processedLen = MemAcc_CurrentJob[areaIndex].ProcessedLength;
     SchM_Exit_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
 
     return processedLen;
@@ -614,6 +405,8 @@ FUNC(void, MEMACC_CODE) MemAcc_Cancel(
     MemAcc_AddressAreaIdType AreaId
 )
 {
+    uint8 areaIndex;
+
 #if (MEMACC_DEV_ERROR_DETECT == STD_ON)
     if (MemAcc_ModuleStatus == MEMACC_UNINIT)
     {
@@ -621,21 +414,26 @@ FUNC(void, MEMACC_CODE) MemAcc_Cancel(
                               MEMACC_SID_CANCEL, MEMACC_E_UNINIT);
         return;
     }
-    if (MemAcc_Internal_FindArea(AreaId) == FALSE)
+    if (MemAcc_Internal_FindArea(AreaId, &areaIndex) == FALSE)
     {
         (void)Det_ReportError(MEMACC_MODULE_ID, MEMACC_INSTANCE_ID,
                               MEMACC_SID_CANCEL, MEMACC_E_PARAM_ADDRESS_AREA);
+        return;
+    }
+#else
+    if (MemAcc_Internal_FindArea(AreaId, &areaIndex) == FALSE)
+    {
         return;
     }
 #endif
 
     SchM_Enter_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
 
-    if (MemAcc_AreaBusy[AreaId] == TRUE)
+    if (MemAcc_AreaBusy[areaIndex] == TRUE)
     {
-        MemAcc_AreaJobResult[AreaId] = MEMACC_JOB_CANCELED;
-        MemAcc_AreaBusy[AreaId] = FALSE;
-        MemAcc_CurrentJob[AreaId].JobType = MEMACC_JOB_NONE;
+        MemAcc_AreaJobResult[areaIndex] = MEMACC_JOB_CANCELED;
+        MemAcc_AreaBusy[areaIndex] = FALSE;
+        MemAcc_CurrentJob[areaIndex].JobType = MEMACC_JOB_NONE;
     }
 
     SchM_Exit_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
@@ -649,6 +447,7 @@ FUNC(MemAcc_JobResultType, MEMACC_CODE) MemAcc_GetJobResult(
 )
 {
     MemAcc_JobResultType result = MEMACC_JOB_OK;
+    uint8 areaIndex;
 
 #if (MEMACC_DEV_ERROR_DETECT == STD_ON)
     if (MemAcc_ModuleStatus == MEMACC_UNINIT)
@@ -657,16 +456,21 @@ FUNC(MemAcc_JobResultType, MEMACC_CODE) MemAcc_GetJobResult(
                               MEMACC_SID_GET_JOB_RESULT, MEMACC_E_UNINIT);
         return MEMACC_JOB_FAILED;
     }
-    if (MemAcc_Internal_FindArea(AreaId) == FALSE)
+    if (MemAcc_Internal_FindArea(AreaId, &areaIndex) == FALSE)
     {
         (void)Det_ReportError(MEMACC_MODULE_ID, MEMACC_INSTANCE_ID,
                               MEMACC_SID_GET_JOB_RESULT, MEMACC_E_PARAM_ADDRESS_AREA);
         return MEMACC_JOB_FAILED;
     }
+#else
+    if (MemAcc_Internal_FindArea(AreaId, &areaIndex) == FALSE)
+    {
+        return MEMACC_JOB_FAILED;
+    }
 #endif
 
     SchM_Enter_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
-    result = MemAcc_AreaJobResult[AreaId];
+    result = MemAcc_AreaJobResult[areaIndex];
     SchM_Exit_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
 
     return result;
@@ -681,6 +485,8 @@ FUNC(Std_ReturnType, MEMACC_CODE) MemAcc_GetSegmentationInfo(
     P2VAR(MemAcc_LengthType, AUTOMATIC, MEMACC_APPL_DATA) PageSizePtr
 )
 {
+    uint8 areaIndex;
+
 #if (MEMACC_DEV_ERROR_DETECT == STD_ON)
     if (MemAcc_ModuleStatus == MEMACC_UNINIT)
     {
@@ -688,7 +494,7 @@ FUNC(Std_ReturnType, MEMACC_CODE) MemAcc_GetSegmentationInfo(
                               MEMACC_SID_GET_SEGMENTATION_INFO, MEMACC_E_UNINIT);
         return E_NOT_OK;
     }
-    if (MemAcc_Internal_FindArea(AreaId) == FALSE)
+    if (MemAcc_Internal_FindArea(AreaId, &areaIndex) == FALSE)
     {
         (void)Det_ReportError(MEMACC_MODULE_ID, MEMACC_INSTANCE_ID,
                               MEMACC_SID_GET_SEGMENTATION_INFO, MEMACC_E_PARAM_ADDRESS_AREA);
@@ -700,10 +506,15 @@ FUNC(Std_ReturnType, MEMACC_CODE) MemAcc_GetSegmentationInfo(
                               MEMACC_SID_GET_SEGMENTATION_INFO, MEMACC_E_PARAM_POINTER);
         return E_NOT_OK;
     }
+#else
+    if (MemAcc_Internal_FindArea(AreaId, &areaIndex) == FALSE)
+    {
+        return E_NOT_OK;
+    }
 #endif
 
-    *SectorSizePtr = MemAcc_ConfigPtr->AddressAreas[AreaId].SectorSize;
-    *PageSizePtr = MemAcc_ConfigPtr->AddressAreas[AreaId].PageSize;
+    *SectorSizePtr = MemAcc_ConfigPtr->AddressAreas[areaIndex].SectorSize;
+    *PageSizePtr = MemAcc_ConfigPtr->AddressAreas[areaIndex].PageSize;
 
     return E_OK;
 }
@@ -716,6 +527,7 @@ FUNC(Std_ReturnType, MEMACC_CODE) MemAcc_RequestLock(
 )
 {
     Std_ReturnType retVal = E_NOT_OK;
+    uint8 areaIndex;
 
 #if (MEMACC_DEV_ERROR_DETECT == STD_ON)
     if (MemAcc_ModuleStatus == MEMACC_UNINIT)
@@ -724,19 +536,24 @@ FUNC(Std_ReturnType, MEMACC_CODE) MemAcc_RequestLock(
                               MEMACC_SID_REQUEST_LOCK, MEMACC_E_UNINIT);
         return E_NOT_OK;
     }
-    if (MemAcc_Internal_FindArea(AreaId) == FALSE)
+    if (MemAcc_Internal_FindArea(AreaId, &areaIndex) == FALSE)
     {
         (void)Det_ReportError(MEMACC_MODULE_ID, MEMACC_INSTANCE_ID,
                               MEMACC_SID_REQUEST_LOCK, MEMACC_E_PARAM_ADDRESS_AREA);
+        return E_NOT_OK;
+    }
+#else
+    if (MemAcc_Internal_FindArea(AreaId, &areaIndex) == FALSE)
+    {
         return E_NOT_OK;
     }
 #endif
 
     SchM_Enter_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
 
-    if (MemAcc_AreaLocked[AreaId] == FALSE)
+    if (MemAcc_AreaLocked[areaIndex] == FALSE)
     {
-        MemAcc_AreaLocked[AreaId] = TRUE;
+        MemAcc_AreaLocked[areaIndex] = TRUE;
         retVal = E_OK;
     }
 
@@ -753,6 +570,7 @@ FUNC(Std_ReturnType, MEMACC_CODE) MemAcc_ReleaseLock(
 )
 {
     Std_ReturnType retVal = E_NOT_OK;
+    uint8 areaIndex;
 
 #if (MEMACC_DEV_ERROR_DETECT == STD_ON)
     if (MemAcc_ModuleStatus == MEMACC_UNINIT)
@@ -761,19 +579,24 @@ FUNC(Std_ReturnType, MEMACC_CODE) MemAcc_ReleaseLock(
                               MEMACC_SID_RELEASE_LOCK, MEMACC_E_UNINIT);
         return E_NOT_OK;
     }
-    if (MemAcc_Internal_FindArea(AreaId) == FALSE)
+    if (MemAcc_Internal_FindArea(AreaId, &areaIndex) == FALSE)
     {
         (void)Det_ReportError(MEMACC_MODULE_ID, MEMACC_INSTANCE_ID,
                               MEMACC_SID_RELEASE_LOCK, MEMACC_E_PARAM_ADDRESS_AREA);
+        return E_NOT_OK;
+    }
+#else
+    if (MemAcc_Internal_FindArea(AreaId, &areaIndex) == FALSE)
+    {
         return E_NOT_OK;
     }
 #endif
 
     SchM_Enter_MemAcc_MEMACC_EXCLUSIVE_AREA_0();
 
-    if (MemAcc_AreaLocked[AreaId] == TRUE)
+    if (MemAcc_AreaLocked[areaIndex] == TRUE)
     {
-        MemAcc_AreaLocked[AreaId] = FALSE;
+        MemAcc_AreaLocked[areaIndex] = FALSE;
         retVal = E_OK;
     }
 

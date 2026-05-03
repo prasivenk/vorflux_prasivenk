@@ -225,41 +225,8 @@ extern FUNC(void, MEMACC_CODE) MemAcc_GetVersionInfo(
 extern FUNC(void, MEMACC_CODE) MemAcc_MainFunction(void);
 
 /*============================================================================*
- *  Internal function declarations (for inter-file linkage)
+ *  Internal declarations have been moved to MemAcc_Internal.h.
+ *  Include MemAcc_Internal.h in MemAcc implementation files only.
  *============================================================================*/
-
-/** \brief Validate address and length within area bounds */
-extern FUNC(boolean, MEMACC_CODE) MemAcc_Internal_ValidateAddress(
-    MemAcc_AddressAreaIdType AreaId,
-    MemAcc_AddressType Address,
-    MemAcc_LengthType Length
-);
-
-/** \brief Translate logical address to physical address */
-extern FUNC(MemAcc_AddressType, MEMACC_CODE) MemAcc_Internal_TranslateAddress(
-    MemAcc_AddressAreaIdType AreaId,
-    MemAcc_AddressType LogicalAddress
-);
-
-/** \brief Find address area config by area ID */
-extern FUNC(boolean, MEMACC_CODE) MemAcc_Internal_FindArea(
-    MemAcc_AddressAreaIdType AreaId
-);
-
-/** \brief Dispatch job to underlying Mem driver */
-extern FUNC(Std_ReturnType, MEMACC_CODE) MemAcc_Internal_DispatchToMemDriver(
-    MemAcc_AddressAreaIdType AreaId
-);
-
-/*============================================================================*
- *  Shared state externs (for inter-file access)
- *============================================================================*/
-
-extern volatile VAR(MemAcc_StatusType, MEMACC_VAR) MemAcc_ModuleStatus;
-extern volatile VAR(MemAcc_JobInfoType, MEMACC_VAR) MemAcc_CurrentJob[];
-extern volatile VAR(MemAcc_JobResultType, MEMACC_VAR) MemAcc_AreaJobResult[];
-extern volatile VAR(boolean, MEMACC_VAR) MemAcc_AreaBusy[];
-extern volatile VAR(boolean, MEMACC_VAR) MemAcc_AreaLocked[];
-extern P2CONST(MemAcc_ConfigType, AUTOMATIC, MEMACC_CONST) MemAcc_ConfigPtr;
 
 #endif /* MEMACC_H */
