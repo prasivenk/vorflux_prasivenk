@@ -95,9 +95,17 @@ static void test_ECC_UncorrectableOnRead(void)
     /* Inject uncorrectable ECC */
     Mem_DFLS_Stub_InjectEccError(FLASH_BASE + 64u, 32u, TRUE);
 
+    Dem_Stub_Reset();
     Fee_Read(1u, 0u, r, 32u); DriveJobToCompletion();
     /* Job should fail due to uncorrectable ECC */
     TEST_ASSERT_NOT_EQUAL(MEMIF_JOB_OK, Fee_GetJobResult());
+    /* DEM must report hardware error for safety traceability */
+    TEST_ASSERT_TRUE(Dem_Stub_GetEventCount() >= 1u);
+    {
+        Dem_Stub_EventType evt = Dem_Stub_GetEvent(0u);
+        TEST_ASSERT_EQUAL(FEE_E_HARDWARE_ERROR, evt.EventId);
+        TEST_ASSERT_EQUAL(DEM_EVENT_STATUS_FAILED, evt.EventStatus);
+    }
 }
 
 /* 3. ECC error before block data area – header affected */

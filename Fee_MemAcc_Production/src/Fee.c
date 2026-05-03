@@ -213,16 +213,23 @@ FUNC(Std_ReturnType, FEE_CODE) Fee_Write(
     }
 #else
     blockIdx = Fee_Internal_FindBlockIndex(BlockNumber);
+    (void)blockIdx;  /* BlockNumber stored in job; state machine re-resolves index */
 #endif
 
     /* Build job */
     job.Type = FEE_JOB_WRITE;
     job.BlockNumber = BlockNumber;
     job.BlockOffset = 0u;
-    job.Length = Fee_ConfigPtr->BlockConfigTable[blockIdx].BlockSize;
     job.ReadDataPtr = NULL_PTR;
     job.WriteDataPtr = DataBufferPtr;
+#if (FEE_DEV_ERROR_DETECT == STD_ON)
+    job.Length = Fee_ConfigPtr->BlockConfigTable[blockIdx].BlockSize;
     job.IsImmediate = Fee_ConfigPtr->BlockConfigTable[blockIdx].ImmediateData;
+#else
+    /* When DET is off, blockIdx may be invalid; state machine resolves from BlockNumber */
+    job.Length = 0u;
+    job.IsImmediate = FALSE;
+#endif
 
     SchM_Enter_Fee_FEE_EXCLUSIVE_AREA_0();
     retVal = Fee_StateMachine_AcceptJob(&job);
